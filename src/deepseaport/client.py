@@ -14,7 +14,18 @@ from . import protocol as P
 logger = logging.getLogger("deepseaport.client")
 
 IMPERSONATE = "chrome"
-DEFAULT_TIMEOUT = 120
+# Per-request stream timeout. curl_cffi treats this as a low-speed/stall
+# timeout for streaming (read timeout), not a hard wall-clock cap, but keep it
+# large enough for long reasoning generations. The server's consumer wait is
+# derived from this value so the two cannot drift apart.
+DEFAULT_TIMEOUT = 300
+
+# Shared session: reuse HTTP/2 connections + TLS across calls. curl_cffi
+# thread-safe: one curl handle per thread (thread-local), so concurrent
+# callers get isolation while each thread reuses its connection. The cookie
+# jar is discarded: the Cookie header is set manually per request and WAF
+# Set-Cookie responses must not mutate a shared jar.
+_SESSION = crequests.Session(impersonate=IMPERSONATE, discard_cookies=True)
 
 
 def _json(resp) -> dict:
@@ -41,8 +52,8 @@ def _biz_error(data: dict) -> tuple[str, str] | None:
 
 
 def create_session(headers: dict) -> str:
-    resp = crequests.post(P.SESSION_URL, headers=headers, json={"agent": "chat"},
-                          impersonate=IMPERSONATE, timeout=30)
+    resp = _SESSION.post(P.SESSION_URL, headers=headers, json={"agent": "chat"},
+                         impersonate=IMPERSONATE, timeout=30)
     data = _json(resp)
     err = _biz_error(data)
     if err:
@@ -56,17 +67,17 @@ def create_session(headers: dict) -> str:
 
 def delete_session(headers: dict, session_id: str) -> None:
     try:
-        crequests.post(P.DELETE_SESSION_URL, headers=headers,
-                       json={"chat_session_id": session_id},
-                       impersonate=IMPERSONATE, timeout=10)
+        _SESSION.post(P.DELETE_SESSION_URL, headers=headers,
+                      json={"chat_session_id": session_id},
+                      impersonate=IMPERSONATE, timeout=10)
     except Exception as exc:
         logger.debug("delete_session ignored: %s", exc)
 
 
 def fetch_pow(headers: dict) -> dict:
-    resp = crequests.post(P.POW_URL, headers=headers,
-                          json={"target_path": P.COMPLETION_PATH},
-                          impersonate=IMPERSONATE, timeout=30)
+    resp = _SESSION.post(P.POW_URL, headers=headers,
+                         json={"target_path": P.COMPLETION_PATH},
+                         impersonate=IMPERSONATE, timeout=30)
     data = _json(resp)
     err = _biz_error(data)
     if err:
@@ -96,8 +107,8 @@ def solve_pow(headers: dict) -> str:
 def stream_completion(headers: dict, payload: dict,
                       timeout: int = DEFAULT_TIMEOUT) -> Iterator[P.StreamEvent]:
     """POST completion and yield parsed events. Caller must close on break."""
-    resp = crequests.post(P.COMPLETION_URL, headers=headers, json=payload,
-                          impersonate=IMPERSONATE, timeout=timeout, stream=True)
+    resp = _SESSION.post(P.COMPLETION_URL, headers=headers, json=payload,
+                         impersonate=IMPERSONATE, timeout=timeout, stream=True)
     if resp.status_code == 200 and "text/event-stream" not in (resp.headers.get("content-type", "") or ""):
         # Some errors arrive as JSON with HTTP 200.
         data = _json(resp)

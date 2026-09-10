@@ -19,6 +19,7 @@ import json
 import logging
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -61,6 +62,12 @@ class ObscuraBridge:
         self.profile = profile or default_profile
         Path(self.profile).mkdir(parents=True, exist_ok=True)
         self.state = WafState()
+        # All obscura subprocesses share one --storage-dir. Parallel warmups
+        # (multi-account 403 refreshes) would race on it and corrupt the
+        # profile/cookie jar, so cold refreshes serialize. The hot path
+        # (cookie_header/has_waf_token) never takes this lock. RLock because
+        # warmup() calls dump_cookies()/fetch_ua() which also lock.
+        self._proc_lock = threading.RLock()
 
     @staticmethod
     def _search_roots() -> list[Path]:
@@ -103,44 +110,59 @@ class ObscuraBridge:
         except Exception as exc:
             return f"unavailable: {exc}"
 
-    def warmup(self, timeout: int = 45) -> dict[str, str]:
-        """Solve/refresh the WAF challenge; return cookie dict (may be empty)."""
-        # Pass 1: execute challenge.js, persist cookies to profile.
+    def _parse_cookie_dump(self, payload: str) -> dict[str, str]:
+        """Extract {name: value} from obscura --dump cookies stdout."""
+        payload = payload or ""
+        start = payload.find("[")
         try:
-            self._run("fetch", CHAT_HOME, "--dump", "cookies", "--timeout", "30",
-                      "--wait", "6", "--quiet", timeout=timeout)
-        except Exception as exc:
-            log.warning("obscura warmup pass1 failed: %s", exc)
-        # Pass 2: read back the jar (proves persistence) + capture UA.
-        # UA rarely changes: reuse cached value to save one browser spawn.
-        cookies = self.dump_cookies()
-        if not cookies and self.state.cookies:
-            log.warning("obscura dump empty, keeping %d cached cookies", len(self.state.cookies))
-            cookies = dict(self.state.cookies)
-        ua = self.state.user_agent or self.fetch_ua()
-        self.state = WafState(cookies=cookies, user_agent=ua, warmed=bool(cookies))
-        log.info("obscura warmup: %d cookies, ua=%s", len(cookies), ua[:60])
-        return cookies
-
-    def dump_cookies(self, timeout: int = 30) -> dict[str, str]:
-        try:
-            proc = self._run("fetch", CHAT_HOME, "--dump", "cookies",
-                             "--timeout", "20", "--quiet", timeout=timeout)
-            payload = proc.stdout.strip()
-            start = payload.find("[")
             items = json.loads(payload[start:] if start >= 0 else payload or "[]")
             return {c["name"]: c["value"] for c in items if c.get("name") and c.get("value")}
-        except Exception as exc:
-            log.warning("obscura dump_cookies failed: %s", exc)
+        except Exception:
             return {}
 
+    def warmup(self, timeout: int = 45) -> dict[str, str]:
+        """Solve/refresh the WAF challenge; return cookie dict (may be empty)."""
+        with self._proc_lock:
+            # Pass 1: execute challenge.js, persist cookies to profile. Its stdout
+            # already carries the cookie dump, so parsing it avoids a second full
+            # browser spawn (pass1 -> dump_cookies would each launch the engine).
+            cookies: dict[str, str] = {}
+            try:
+                proc = self._run("fetch", CHAT_HOME, "--dump", "cookies", "--timeout", "30",
+                                 "--wait", "6", "--quiet", timeout=timeout)
+                cookies = self._parse_cookie_dump(proc.stdout)
+            except Exception as exc:
+                log.warning("obscura warmup pass1 failed: %s", exc)
+            # Pass 2 (fallback): read back the jar (proves persistence) + capture UA.
+            # UA rarely changes: reuse cached value to save one browser spawn.
+            if not cookies:
+                cookies = self.dump_cookies()
+            if not cookies and self.state.cookies:
+                log.warning("obscura dump empty, keeping %d cached cookies", len(self.state.cookies))
+                cookies = dict(self.state.cookies)
+            ua = self.state.user_agent or self.fetch_ua()
+            self.state = WafState(cookies=cookies, user_agent=ua, warmed=bool(cookies))
+            log.info("obscura warmup: %d cookies, ua=%s", len(cookies), ua[:60])
+            return cookies
+
+    def dump_cookies(self, timeout: int = 30) -> dict[str, str]:
+        with self._proc_lock:
+            try:
+                proc = self._run("fetch", CHAT_HOME, "--dump", "cookies",
+                                 "--timeout", "20", "--quiet", timeout=timeout)
+                return self._parse_cookie_dump(proc.stdout)
+            except Exception as exc:
+                log.warning("obscura dump_cookies failed: %s", exc)
+                return {}
+
     def fetch_ua(self, timeout: int = 30) -> str:
-        try:
-            proc = self._run("fetch", "https://example.com", "--eval", "navigator.userAgent",
-                             "--timeout", "20", "--quiet", timeout=timeout)
-            return proc.stdout.strip().strip('"')[:300]
-        except Exception:
-            return ""
+        with self._proc_lock:
+            try:
+                proc = self._run("fetch", "https://example.com", "--eval", "navigator.userAgent",
+                                 "--timeout", "20", "--quiet", timeout=timeout)
+                return proc.stdout.strip().strip('"')[:300]
+            except Exception:
+                return ""
 
     def cookie_header(self) -> str:
         return "; ".join(f"{k}={v}" for k, v in self.state.cookies.items())

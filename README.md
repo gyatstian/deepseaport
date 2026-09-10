@@ -1,7 +1,15 @@
+## Setup in simple terms
+- install [obscura](https://github.com/h4ckf0r0day/obscura/releases) (no-render stealth is the one i use)
+- install the newest [release](https://github.com/gyatstian/deepseaport/releases) (TIP: CLICK THE BLUE TEXT)
+- place obscura and deepseaport next to eachother or put obscura in PATH
+- open deepseaport, add account(s) and then start server.
+- *optionally play around with settings or/and config.json!*
+- base url: http://127.0.0.1:5001/v1
+
 # notice
-deepseek on the website feels lobotomized/lazy, though it's not that bad, and you can definitely make it much better with skills or good prompting<br>
-tool calling is ok. sometimes fails on opencode but he finds a way around it eventually<br>
-app needs https://aka.ms/vs/17/release/vc_redist.x64.exe to run obscura
+- deepseek on the website feels lobotomized/lazy, though it's not that bad, and you can definitely make it much better with skills or good prompting. it seems the longer the prompt is, the more he thinks<br>
+- tool calling seems ok. sometimes fails on long/complicated ones but he finds a way around<br>
+- app needs https://aka.ms/vs/17/release/vc_redist.x64.exe beacuse of obscura
 
 # deepseaport — DeepSeek web2api (Obscura-backed)
 

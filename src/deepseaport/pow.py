@@ -17,6 +17,8 @@ logger = logging.getLogger("deepseaport.pow")
 WASM_NAME = "sha3_wasm_bg.7b9ca65ddd.wasm"
 WASM_URL = "https://fe-static.deepseek.com/chat/static/" + WASM_NAME
 ALGORITHM = "DeepSeekHashV1"
+# WebAssembly modules start with the magic bytes b"\0asm" (then version 1).
+_WASM_MAGIC = b"\x00asm"
 
 # Cached compiled wasm: Engine + Module are thread-safe/shareable, while
 # Store/instance stay per-call. Recompiling per request cost 100-300ms.
@@ -24,11 +26,18 @@ _ENGINE = None
 _MODULE = None
 _MODULE_KEY: tuple | None = None
 _MODULE_LOCK = threading.Lock()
+_LINKER = None
+_LINKER_LOCK = threading.Lock()
+_WASM_PATH: Path | None = None
 
-
+# DATA_DIR is resolved once at import from the environment; it never changes
+# for a process. Cache the joined path to avoid a mkdir syscall per request.
 def wasm_path() -> Path:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    return DATA_DIR / WASM_NAME
+    global _WASM_PATH
+    if _WASM_PATH is None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _WASM_PATH = DATA_DIR / WASM_NAME
+    return _WASM_PATH
 
 
 def ensure_wasm(cookies: str = "", user_agent: str = "") -> Path:
@@ -43,8 +52,18 @@ def ensure_wasm(cookies: str = "", user_agent: str = "") -> Path:
         headers["Cookie"] = cookies
     resp = crequests.get(WASM_URL, headers=headers, impersonate="chrome", timeout=60)
     resp.raise_for_status()
-    path.write_bytes(resp.content)
-    logger.info("downloaded PoW wasm (%d bytes)", len(resp.content))
+    content = resp.content or b""
+    # Wrong host / WAF interstitial returns index.html with a 200. Reject
+    # anything that is not a real wasm module before it reaches disk, so a
+    # bad download fails here instead of as a confusing Module parse later.
+    if len(content) <= 1000:
+        raise RuntimeError(f"PoW wasm download too small ({len(content)} bytes)")
+    if not content.startswith(_WASM_MAGIC):
+        raise RuntimeError(
+            f"PoW wasm download is not a wasm module "
+            f"(magic={content[:4]!r}, {len(content)} bytes)")
+    path.write_bytes(content)
+    logger.info("downloaded PoW wasm (%d bytes)", len(content))
     return path
 
 
@@ -80,7 +99,14 @@ def solve(algorithm: str, challenge: str, salt: str, difficulty: int | float, ex
     prefix = f"{salt}_{expire_at}_"
     engine, module = _get_engine_module()
     store = Store(engine)
-    linker = Linker(engine)
+    # Linker is thread-safe and bound to the (cached) engine: share it instead
+    # of rebuilding per solve. Store stays per-call (not thread-safe to share).
+    global _LINKER
+    if _LINKER is None:
+        with _LINKER_LOCK:
+            if _LINKER is None:
+                _LINKER = Linker(engine)
+    linker = _LINKER
     instance = linker.instantiate(store, module)
     exports = instance.exports(store)
     memory = exports["memory"]

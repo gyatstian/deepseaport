@@ -118,14 +118,17 @@ def render_prompt(messages: list[dict]) -> str:
             text = f"Tool {name} returned: {text}"
             role = "user"  # tool output is new information for the model
         blocks.append((role, text))
-    merged: list[tuple[str, str]] = []
+    # Accumulate chunks per role instead of concatenating the growing string
+    # (O(n^2) on long same-role runs produced by tool loops).
+    merged: list[tuple[str, list[str]]] = []
     for role, text in blocks:
         if merged and merged[-1][0] == role:
-            merged[-1] = (role, merged[-1][1] + "\n\n" + text)
+            merged[-1][1].append(text)
         else:
-            merged.append((role, text))
+            merged.append((role, [text]))
     parts = []
-    for idx, (role, text) in enumerate(merged):
+    for idx, (role, chunks) in enumerate(merged):
+        text = "\n\n".join(chunks)
         if role == "assistant":
             parts.append(f"<Assistant>{text}<endofsentence>")
         elif role in ("user", "system"):
@@ -396,6 +399,9 @@ def parse_tool_calls(text: str, tools: list[dict] | None = None) -> tuple[list[d
     valid_or_none = valid if tools else None
 
     # Format 1: {"tool_calls": [...]} — balanced scan for robustness.
+    # The nearest preceding "{" position is monotonic over increasing marker
+    # positions, so cache it to avoid an O(n) rfind per marker (O(n^2) total).
+    scan_from = 0
     for match in re.finditer(r'"tool_calls"\s*:\s*\[', text):
         arr_start = match.group(0).rfind("[") + match.start()
         depth = 0
@@ -423,7 +429,9 @@ def parse_tool_calls(text: str, tools: list[dict] | None = None) -> tuple[list[d
                         break
         if end < 0:
             continue
-        obj_start = text.rfind("{", 0, match.start())
+        obj_start = text.rfind("{", scan_from, match.start())
+        if obj_start >= 0:
+            scan_from = obj_start
         obj_text = _balanced_json(text, obj_start) if obj_start >= 0 else None
         if not obj_text:
             continue
