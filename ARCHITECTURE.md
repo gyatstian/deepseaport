@@ -1,0 +1,121 @@
+# deepseaport architecture & reverse-engineering notes
+
+How the bridge works and everything non-obvious discovered while building it.
+Read this before touching `protocol.py`, `pow.py`, `accounts.py`, or auth.
+
+## Big picture
+
+```
+harness -> FastAPI (/v1/*, OpenAI-compatible) -> curl_cffi (Chrome TLS) -> chat.deepseek.com
+                                                        ^
+Obscura (h4ckf0r0day/obscura, headless browser) ________|
+  - owns persistent profile (~/.deepseaport/obscura-profile)
+  - solves AWS WAF JS challenge, holds `aws-waf-token` cookie
+  - performs login (real device fingerprint)
+  - MCP stdio used for interactive login only
+```
+
+Hot path is **direct HTTP, never DOM driving**. Obscura is re-invoked only
+to refresh the WAF token (startup + on HTTP 403). Binary resolution
+(`obscura_bridge.py:_discover`): `obscura_bin` config / `OBSCURA_BIN` env
+first, then PATH, then a repo-local drop-in — `obscura.exe` (or `obscura`
+on unix) next to `config.json` / repo root, or under `bin/`, `tools/`,
+`vendor/`, `obscura-*/`. v0.2.1 no-render build is enough — no screenshots
+needed. Local binaries are gitignored, never committed.
+
+## Request lifecycle (per chat completion)
+
+1. Acquire account (one in-flight stream per account — DeepSeek limitation,
+   enforced by per-account `threading.Lock` + rotation + 120 s cooldown).
+2. Token: pasted `userToken` from login, else password login (see Auth).
+3. `POST /api/v0/chat_session/create` `{"agent":"chat"}` → session id.
+   Response shapes vary; parse `data.biz_data.id` or `data.biz_data.chat_session.id`.
+4. `POST /api/v0/chat/create_pow_challenge` `{"target_path":"/api/v0/chat/completion"}`.
+5. Solve PoW (`DeepSeekHashV1`, wasm, prefix `"{salt}_{expire_at}_"`), send as
+   `X-DS-PoW-Response: base64(json({algorithm,challenge,salt,answer,signature,target_path}))`.
+6. `POST /api/v0/chat/completion` (SSE `text/event-stream`) with payload:
+   `{chat_session_id, parent_message_id: null, model_type: "default", prompt,
+   ref_file_ids: [], thinking_enabled, search_enabled, source: "web",
+   action: null, preempt: false}` (+ Bearer + WAF cookies + PoW header).
+7. Parse SSE → OpenAI chunks/JSON. `DELETE /api/v0/chat_session/delete` in `finally`.
+
+Retry policy: fresh PoW once on PoW errors, recreate session once on
+`INVALID_SESSION_ID`, Obscura warmup + retry once on 403/WAF. Mark account
+bad (cooldown) on ban/restricted/401.
+
+## SSE stream shape (verified against live traffic)
+
+- `event: ready` + `data: {request_message_id, response_message_id, model_type}` opens.
+- Deltas: `data: {"p":"response/content","o":"APPEND","v":"..."}` and
+  `{"p":"response/thinking_content",...}`.
+- **Continuation chunks omit `p`**: bare `data: {"v":"api"}` continues the
+  last path. `StreamParser` tracks `last_path`; a stateless parser silently
+  truncates replies (this bug actually shipped once — reply came back "web"
+  instead of "web2api-ok").
+- `{"p":"response/accumulated_token_usage","o":"SET","v":47}` is the **real**
+  token usage — prefer it over the `len//4` estimate.
+- End: `{"p":"response/status","v":"FINISHED"}`, then `event: finish`,
+  `event: title`, `event: close`. Stream close without FINISHED also means done.
+- `{"v":"<n>"}` heartbeats between chunks are content when `last_path` is
+  content (e.g. "web","2","api","-","ok" spells "web2api-ok").
+
+## Auth (hard-won)
+
+- Token lives in page localStorage as JSON: `userToken = {"value":"<64-char>","__version":"0"}`.
+- Direct `POST /api/v0/users/login` (web headers) → `biz_code 11 RISK_DEVICE_DETECTED`.
+  Direct login is fingerprinted (fp-1.min.js, fengkongcloud deviceprofile, `did`).
+- Old mobile path (`DeepSeek/1.0.13 Android/35`, `x-client-version 1.3.0-auto-resume`)
+  → `CLIENT_VERSION_TOO_LOW`. Do not chase client versions.
+- Working path: Obscura MCP (`mcp_client.py`, stdlib JSON-RPC over stdio):
+  `browser_navigate .../sign_in` → `browser_interactive_elements` (refs are
+  **per-connection** — snapshot + fill + click must share one `McpClient`) →
+  fill `e1`/`e2`, click `e8` (Log in) → poll `localStorage.getItem('userToken')`.
+  No turnstile appeared during testing, but if login ever yields no token,
+  assume captcha and fall back to manual token paste.
+- Old/stale tokens fail with `40003 Authorization Failed` at session create.
+
+## PoW details
+
+- Wasm URL host is **`fe-static.deepseek.com`**, not `chat.deepseek.com`:
+  `https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm`.
+  Downloading from the wrong host returns the SPA `index.html` (wasmtime then
+  fails with `expected '('`) — validate size/magic, not just HTTP 200.
+- `PoW.ensure_wasm()` downloads on demand into `data/`; solving takes ~0.5 s.
+
+## Tool calling (agentic harness)
+
+Web model has no native function calling. `tools_support.render_prompt()`
+flattens OpenAI messages (`<User>`/`<Assistant>…<endofsentence>` markers,
+`[I called tools: …]` records, `Tool <name> returned: …` results as user
+turns); `tool_system_prompt()` injects schemas; `parse_tool_calls()` accepts
+`{"tool_calls":[…]}` (balanced-brace scan), `<tool_call>`/`<function_call>`/
+`<invoke>` tags, and fenced-json fallback; unknown names dropped, args
+normalized to JSON strings, ids `call_001…`. Stream and non-stream both end
+with `finish_reason: "tool_calls"`. Multi-step loops verified live
+(weather → tool result → final answer).
+
+## Models (v4.1 lineup, Sep 2026)
+
+Only these four; no Pro/expert exists yet (flash superseded v4 Pro):
+
+| id | thinking | search |
+|---|---|---|
+| `deepseek-flash` | no | no |
+| `deepseek-flash-reasoner` | yes (`reasoning_content`) | no |
+| `deepseek-flash-search` | no | yes |
+| `deepseek-flash-reasoner-search` | yes | yes |
+
+`thinking_enabled`/`search_enabled` are the real backend switches;
+`model_type` stays `"default"`. Removed: `deepseek-chat/v3/r1`, `-search`
+variants under old names, `deepseek-vision`.
+
+## Environment / files
+
+- `config.json` (gitignored): `{keys, accounts[{email,mobile,password,token}], obscura_bin, obscura_profile, port, listen}`.
+  `listen: true` binds `0.0.0.0` (LAN); default false binds `127.0.0.1`; `--host` overrides.
+- `data/` (gitignored): PoW wasm. `~/.deepseaport/obscura-profile`: WAF cookies + login localStorage.
+- `src/deepseaport/mcp_client.py` is used by `deepseaport login` only, not the hot path.
+- `GET /v1/waf/status` shows binary/profile/WAF-cookie state for debugging.
+- Live verification scripts used during development live in the temp dir, not
+  the repo: `verify_live2.py` (session→PoW→completion), `verify_tools.py`
+  (tool loop), `verify_http.py` (HTTP stream/tools/reasoner), `verify_models.py`.

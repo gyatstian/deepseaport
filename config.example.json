@@ -1,0 +1,18 @@
+{
+  "keys": ["sk-local-dev"],
+  "accounts": [
+    { "email": "", "password": "", "token": "" }
+  ],
+  "active_account": "",
+  "obscura_bin": "",
+  "obscura_profile": "",
+  "port": 5001,
+  "listen": false,
+  "enable_tools": true,
+  "warmup_on_startup": true,
+  "auto_delete_session": true,
+  "max_retries": 1,
+  "parallel_challenge_fetch": true,
+  "log_level": "INFO",
+  "stream_mode": "buffered"
+}
