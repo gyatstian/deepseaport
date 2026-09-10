@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import queue
+import os
 import threading
 import time
 import uuid
@@ -41,6 +41,24 @@ MODELS = {
     "deepseek-flash-reasoner-search": (True, True, "default"),
 }
 
+# Shared executors: replacing per-request ThreadPoolExecutor/thread churn.
+# Challenge work (create_session + fetch_pow) is I/O-bound; sized generously
+# so concurrent completions never serialize (previously one 2-worker executor
+# per request). Cleanup (delete_session) is fire-and-forget best-effort.
+_DEFAULT_POOL_SIZE = min(32, (os.cpu_count() or 1) + 4)
+_CHALLENGE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2 * _DEFAULT_POOL_SIZE, thread_name_prefix="ds-challenge")
+_CLEANUP_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_DEFAULT_POOL_SIZE, thread_name_prefix="ds-cleanup")
+
+# Consumer wait (seconds) for a producer event, on top of the curl stream
+# timeout. Keeps the async reader from timing out before the blocking call.
+_CONSUMER_GRACE_SECONDS = 10
+
+
+class _StreamCancelled(Exception):
+    """Internal: client disconnected, producer should stop at the next event."""
+
 
 def apply_log_level(level: str) -> None:
     """Apply log level to deepseaport loggers (settings-driven, no handler reset)."""
@@ -61,6 +79,9 @@ async def lifespan(app: FastAPI):
     if getattr(settings, "warmup_on_startup", True):
         threading.Thread(target=_startup_warm, args=(bridge,), daemon=True).start()
     yield
+    # NOTE: module-level executors intentionally NOT shut down here: lifespan
+    # can run multiple times per process (tests, reload) and a shutdown
+    # executor raises RuntimeError on submit. Threads exit at process end.
 
 
 def _startup_warm(bridge: ObscuraBridge) -> None:
@@ -342,21 +363,36 @@ def _session_and_challenge(headers: dict, parallel: bool = True) -> tuple[str, d
     """
     if not parallel:
         session_id = DS.create_session(headers)
-        challenge = DS.fetch_pow(headers)
-        return session_id, challenge
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        fut_session = ex.submit(DS.create_session, headers)
-        fut_challenge = ex.submit(DS.fetch_pow, headers)
         try:
-            session_id = fut_session.result()
+            challenge = DS.fetch_pow(headers)
         except Exception:
+            # Session created but challenge failed: don't leak it.
             try:
-                fut_challenge.result()
+                DS.delete_session(headers, session_id)
             except Exception:
                 pass
             raise
-        challenge = fut_challenge.result()
         return session_id, challenge
+    fut_session = _CHALLENGE_EXECUTOR.submit(DS.create_session, headers)
+    fut_challenge = _CHALLENGE_EXECUTOR.submit(DS.fetch_pow, headers)
+    try:
+        session_id = fut_session.result()
+    except Exception:
+        try:
+            fut_challenge.result()
+        except Exception:
+            pass
+        raise
+    try:
+        challenge = fut_challenge.result()
+    except Exception:
+        # Session was created but challenge fetch failed: don't leak it.
+        try:
+            DS.delete_session(headers, session_id)
+        except Exception:
+            pass
+        raise
+    return session_id, challenge
 
 
 def _header_from_challenge(challenge: dict) -> str:
@@ -386,7 +422,7 @@ def _delete_session_bg(headers: dict, session_id: str | None, enabled: bool = Tr
             pass
 
     try:
-        threading.Thread(target=_run, daemon=True).start()
+        _CLEANUP_EXECUTOR.submit(_run)
     except Exception:
         pass
 
@@ -399,9 +435,10 @@ def _app_settings(app: FastAPI) -> Settings:
     return settings
 
 
-def _run_completion(app: FastAPI, item: PooledAccount, prep: dict) -> dict:
+def _run_completion(app: FastAPI, item: PooledAccount, prep: dict,
+                    cancel_event: threading.Event | None = None) -> dict:
     """Blocking full completion with retries per failure class."""
-    return _run_completion_core(app, item, prep)
+    return _run_completion_core(app, item, prep, cancel_event=cancel_event)
 
 
 def _run_completion_core(
@@ -410,6 +447,7 @@ def _run_completion_core(
     prep: dict,
     on_content=None,
     on_thinking=None,
+    cancel_event: threading.Event | None = None,
 ) -> dict:
     """Shared retry engine for buffered + live streaming.
 
@@ -418,6 +456,9 @@ def _run_completion_core(
     arrives; retryable failures (PoW/session/WAF) normally carry no content
     prefix, so the risk of interleaving partial text across retries is minimal.
     Buffered callers pass no callbacks and get identical behaviour to before.
+
+    cancel_event, when set, aborts the attempt at the next SSE event so a
+    disconnected client does not keep the account lock for the whole reply.
     """
     settings = _app_settings(app)
     max_retries = max(0, int(getattr(settings, "max_retries", 1)))
@@ -425,6 +466,10 @@ def _run_completion_core(
     auto_delete = bool(getattr(settings, "auto_delete_session", True))
     token = _ensure_token(app, item)
     session_id: str | None = None
+
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     # Fast path: skip cookie-header builds when wasm already cached.
     try:
         wp = PoW.wasm_path()
@@ -433,43 +478,55 @@ def _run_completion_core(
                             user_agent=app.state.bridge.state.user_agent)
     except Exception as exc:
         logger.warning("wasm ensure failed: %s", exc)
-    headers = _headers(app, token)
-    session_id, challenge = _session_and_challenge(headers, parallel=parallel)
-    headers = {**headers, "X-DS-PoW-Response": _header_from_challenge(challenge)}
-    payload = P.completion_payload(session_id, prep["prompt"], prep["thinking"],
-                                   prep["search"], prep["model_type"])
+    # Session creation + PoW solve sit inside the try so a solver failure
+    # (answer None -> RuntimeError) still runs the finally cleanup below.
     try:
+        headers = _headers(app, token)
+        session_id, challenge = _session_and_challenge(headers, parallel=parallel)
+        headers = {**headers, "X-DS-PoW-Response": _header_from_challenge(challenge)}
+        payload = P.completion_payload(session_id, prep["prompt"], prep["thinking"],
+                                       prep["search"], prep["model_type"])
         content, think, error, usage_total = _attempt(
-            headers, payload, on_content=on_content, on_thinking=on_thinking)
+            headers, payload, on_content=on_content, on_thinking=on_thinking,
+            cancel_event=cancel_event)
         for _ in range(max_retries):
-            if not (error and "pow" in error.lower()):
+            if _cancelled() or not (error and "pow" in error.lower()):
                 break
             logger.info("pow rejected, solving fresh (retries left %s)", max_retries)
             headers = _solve(app, token)
             content, think, error, usage_total = _attempt(
-                headers, payload, on_content=on_content, on_thinking=on_thinking)
-        # Session recreate needs a fresh payload bound to the new session id.
+                headers, payload, on_content=on_content, on_thinking=on_thinking,
+                cancel_event=cancel_event)
+        # Session recreate needs a fresh payload bound to the new session id
+        # and a fresh PoW header (the old one may have expired by now).
         for _ in range(max_retries):
-            if not (error and error.startswith("INVALID_SESSION_ID")):
+            if _cancelled() or not (error and error.startswith("INVALID_SESSION_ID")):
                 break
             logger.info("session invalid, recreating (retries left %s)", max_retries)
             session_id = DS.create_session(_headers(app, token))
+            headers = _solve(app, token)
             payload = P.completion_payload(session_id, prep["prompt"], prep["thinking"],
                                            prep["search"], prep["model_type"])
             content, think, error, usage_total = _attempt(
-                headers, payload, on_content=on_content, on_thinking=on_thinking)
+                headers, payload, on_content=on_content, on_thinking=on_thinking,
+                cancel_event=cancel_event)
         for _ in range(max_retries):
-            if not (error and ("403" in error or "WAF" in error)):
+            if _cancelled() or not (error and ("403" in error or "WAF" in error)):
                 break
             logger.info("possible WAF block, refreshing cookies (retries left %s)", max_retries)
             app.state.bridge.warmup()
             headers = _solve(app, token)
             content, think, error, usage_total = _attempt(
-                headers, payload, on_content=on_content, on_thinking=on_thinking)
+                headers, payload, on_content=on_content, on_thinking=on_thinking,
+                cancel_event=cancel_event)
+        if _cancelled():
+            raise _StreamCancelled()
         if error:
             low = error.lower()
-            if any(k in low for k in ("banned", "restricted", "401", "unauthorized",
-                                      "rate_limit", "too frequent", "too_frequent", "429")):
+            # Ban/auth family is account-specific: cool that account down.
+            # Rate-limit family is usually a global throttle, so do NOT poison
+            # a specific account (that would rotate through and shrink the pool).
+            if any(k in low for k in ("banned", "restricted", "401", "unauthorized")):
                 AccountPool.mark_bad(item)
             if any(k in low for k in ("rate_limit", "too frequent", "too_frequent", "429")):
                 raise HTTPException(status_code=429,
@@ -492,12 +549,17 @@ def _run_completion_core(
 
 
 def _attempt(headers: dict, payload: dict, on_content=None, on_thinking=None,
+             cancel_event: threading.Event | None = None,
              ) -> tuple[str, str, str | None, int]:
     content: list[str] = []
     think: list[str] = []
     error: str | None = None
     usage_total = 0
     for event in DS.stream_completion(headers, payload):
+        if cancel_event is not None and cancel_event.is_set():
+            # Client gone: stop reading so the generator's finally closes the
+            # HTTP response and the account lock is released promptly.
+            break
         if event.kind == "content":
             content.append(event.text)
             if on_content is not None:
@@ -530,18 +592,41 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
     model = prep["model"]
-    out: queue.Queue = queue.Queue()
+    out: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
     settings = _app_settings(app)
     live = str(getattr(settings, "stream_mode", "buffered")).lower() == "live"
+    # Consumer wait must outlast the blocking curl stream timeout, otherwise the
+    # async reader times out while the producer is still working on a valid long
+    # reply. Derive it so the two can never drift apart.
+    consumer_timeout = float(DS.DEFAULT_TIMEOUT) + _CONSUMER_GRACE_SECONDS
+    # Set when the client disconnects (generator GC/close): the producer checks
+    # it between SSE events and stops, releasing the account lock promptly.
+    cancel_event = threading.Event()
+
+    def _emit(item: tuple) -> None:
+        # call_soon_threadsafe raises RuntimeError once the loop is closed
+        # (shutdown). Swallow: producer work is best-effort at that point.
+        try:
+            loop.call_soon_threadsafe(out.put_nowait, item)
+        except RuntimeError:
+            pass
+
+    def _put(kind: str, text: str) -> None:
+        if text:
+            _emit((kind, text))
 
     def produce_buffered():
         try:
-            result = _run_completion(app, item, prep)
-            out.put(("done", result))
+            result = _run_completion(
+                app, item, prep, cancel_event=cancel_event)
+            _emit(("done", result))
+        except _StreamCancelled:
+            pass
         except HTTPException as exc:
-            out.put(("http_error", exc))
+            _emit(("http_error", exc))
         except Exception as exc:  # noqa: BLE001
-            out.put(("error", str(exc)))
+            _emit(("error", str(exc)))
         finally:
             AccountPool.release(item)
 
@@ -550,21 +635,20 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
         # Content streams live only when no tools requested; with tools the
         # content is buffered so a tool_calls reply is not also emitted as
         # user-visible text.
-        def _put(kind: str, text: str) -> None:
-            if text:
-                out.put((kind, text))
-
         try:
             result = _run_completion_core(
                 app, item, prep,
                 on_content=(None if prep.get("tools") else lambda t: _put("content", t)),
                 on_thinking=lambda t: _put("thinking", t),
+                cancel_event=cancel_event,
             )
-            out.put(("done", result))
+            _emit(("done", result))
+        except _StreamCancelled:
+            pass
         except HTTPException as exc:
-            out.put(("http_error", exc))
+            _emit(("http_error", exc))
         except Exception as exc:  # noqa: BLE001
-            out.put(("error", str(exc)))
+            _emit(("error", str(exc)))
         finally:
             AccountPool.release(item)
 
@@ -575,37 +659,87 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
             ensure_ascii=False) + "\n\n").encode("utf-8")
 
     threading.Thread(target=produce_live if live else produce_buffered, daemon=True).start()
-    yield chunk({"role": "assistant"})
-    if not live:
-        # Buffered: producer sends one reply per request; emit thinking+content
-        # once the reply lands, then tool deltas. First-byte ~= model latency.
+    try:
+        yield chunk({"role": "assistant"})
+        if not live:
+            # Buffered: producer sends one reply per request; emit thinking+content
+            # once the reply lands, then tool deltas. First-byte ~= model latency.
+            while True:
+                try:
+                    kind, payload = await asyncio.wait_for(out.get(), timeout=consumer_timeout)
+                except asyncio.TimeoutError:
+                    yield ("data: " + json.dumps({"error": {"message": "upstream timed out"}},
+                                                ensure_ascii=False) + "\n\n").encode()
+                    yield b"data: [DONE]\n\n"
+                    return
+                if kind == "done":
+                    thinking, content = payload["thinking"], payload["content"]
+                    calls, remaining = (await asyncio.to_thread(parse_tool_calls, content, prep["tools"])
+                                        if prep["tools"] else (None, content))
+                    if prep["tools"] and not calls:
+                        logger.debug("stream no tool call parsed model=%s preview=%.200s",
+                                     prep.get("model"), (content or "")[:200])
+                    if thinking:
+                        yield chunk({"reasoning_content": thinking})
+                    if remaining:
+                        yield chunk({"content": remaining})
+                    if calls:
+                        for call in calls:
+                            yield chunk({"tool_calls": [{
+                                "id": call["id"], "type": "function",
+                                "function": {"name": call["function"]["name"],
+                                             "arguments": call["function"]["arguments"]}}]})
+                        yield chunk({}, "tool_calls")
+                    else:
+                        yield chunk({}, "stop")
+                    yield b"data: [DONE]\n\n"
+                    return
+                if kind == "http_error":
+                    err = payload
+                    yield ("data: " + json.dumps({"error": {"message": err.detail, "code": err.status_code}},
+                                                ensure_ascii=False) + "\n\n").encode()
+                    yield b"data: [DONE]\n\n"
+                    return
+                yield ("data: " + json.dumps({"error": {"message": str(payload)}},
+                                            ensure_ascii=False) + "\n\n").encode()
+                yield b"data: [DONE]\n\n"
+                return
+        # Live: forward thinking/content deltas as they arrive from DeepSeek.
         while True:
             try:
-                kind, payload = await asyncio.to_thread(out.get, True, 310)
-            except queue.Empty:
+                kind, payload = await asyncio.wait_for(out.get(), timeout=consumer_timeout)
+            except asyncio.TimeoutError:
                 yield ("data: " + json.dumps({"error": {"message": "upstream timed out"}},
                                             ensure_ascii=False) + "\n\n").encode()
                 yield b"data: [DONE]\n\n"
                 return
+            if kind == "thinking":
+                yield chunk({"reasoning_content": payload})
+                continue
+            if kind == "content":
+                yield chunk({"content": payload})
+                continue
             if kind == "done":
-                thinking, content = payload["thinking"], payload["content"]
-                calls, remaining = (parse_tool_calls(content, prep["tools"])
-                                    if prep["tools"] else (None, content))
-                if prep["tools"] and not calls:
-                    logger.debug("stream no tool call parsed model=%s preview=%.200s",
-                                 prep.get("model"), (content or "")[:200])
-                if thinking:
-                    yield chunk({"reasoning_content": thinking})
-                if remaining:
-                    yield chunk({"content": remaining})
-                if calls:
-                    for call in calls:
-                        yield chunk({"tool_calls": [{
-                            "id": call["id"], "type": "function",
-                            "function": {"name": call["function"]["name"],
-                                         "arguments": call["function"]["arguments"]}}]})
-                    yield chunk({}, "tool_calls")
+                content = payload["content"]
+                if prep.get("tools"):
+                    calls, remaining = await asyncio.to_thread(parse_tool_calls, content, prep["tools"])
+                    if not calls:
+                        logger.debug("stream no tool call parsed model=%s preview=%.200s",
+                                     prep.get("model"), (content or "")[:200])
+                    # Thinking already streamed live; emit only the remainder.
+                    if remaining:
+                        yield chunk({"content": remaining})
+                    if calls:
+                        for call in calls:
+                            yield chunk({"tool_calls": [{
+                                "id": call["id"], "type": "function",
+                                "function": {"name": call["function"]["name"],
+                                             "arguments": call["function"]["arguments"]}}]})
+                        yield chunk({}, "tool_calls")
+                    else:
+                        yield chunk({}, "stop")
                 else:
+                    # Content already streamed live; just close.
                     yield chunk({}, "stop")
                 yield b"data: [DONE]\n\n"
                 return
@@ -619,55 +753,10 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
                                         ensure_ascii=False) + "\n\n").encode()
             yield b"data: [DONE]\n\n"
             return
-    # Live: forward thinking/content deltas as they arrive from DeepSeek.
-    while True:
-        try:
-            kind, payload = await asyncio.to_thread(out.get, True, 310)
-        except queue.Empty:
-            yield ("data: " + json.dumps({"error": {"message": "upstream timed out"}},
-                                        ensure_ascii=False) + "\n\n").encode()
-            yield b"data: [DONE]\n\n"
-            return
-        if kind == "thinking":
-            yield chunk({"reasoning_content": payload})
-            continue
-        if kind == "content":
-            yield chunk({"content": payload})
-            continue
-        if kind == "done":
-            content = payload["content"]
-            if prep.get("tools"):
-                calls, remaining = parse_tool_calls(content, prep["tools"])
-                if not calls:
-                    logger.debug("stream no tool call parsed model=%s preview=%.200s",
-                                 prep.get("model"), (content or "")[:200])
-                # Thinking already streamed live; emit only the remainder.
-                if remaining:
-                    yield chunk({"content": remaining})
-                if calls:
-                    for call in calls:
-                        yield chunk({"tool_calls": [{
-                            "id": call["id"], "type": "function",
-                            "function": {"name": call["function"]["name"],
-                                         "arguments": call["function"]["arguments"]}}]})
-                    yield chunk({}, "tool_calls")
-                else:
-                    yield chunk({}, "stop")
-            else:
-                # Content already streamed live; just close.
-                yield chunk({}, "stop")
-            yield b"data: [DONE]\n\n"
-            return
-        if kind == "http_error":
-            err = payload
-            yield ("data: " + json.dumps({"error": {"message": err.detail, "code": err.status_code}},
-                                        ensure_ascii=False) + "\n\n").encode()
-            yield b"data: [DONE]\n\n"
-            return
-        yield ("data: " + json.dumps({"error": {"message": str(payload)}},
-                                    ensure_ascii=False) + "\n\n").encode()
-        yield b"data: [DONE]\n\n"
-        return
+    finally:
+        # Generator closed (client disconnect, cancellation, completion): tell
+        # the producer to stop at the next event so the account lock frees.
+        cancel_event.set()
 
 
 def _openai_response(prep: dict, result: dict) -> dict:

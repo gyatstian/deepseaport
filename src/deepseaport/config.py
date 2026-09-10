@@ -5,11 +5,18 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_PORT = 5001
 PACKAGE_DIR = Path(__file__).resolve().parent
+
+# Serializes config.json writes within the process. Callers span the event
+# loop (endpoint saves) and worker threads (_ensure_token / account pool);
+# without this a concurrent Path.write_text can truncate/interleave the file.
+_CONFIG_SAVE_LOCK = threading.Lock()
 
 
 def _app_dir() -> Path:
@@ -82,7 +89,27 @@ class Settings:
             "log_level": self.log_level,
             "stream_mode": self.stream_mode,
         }
-        Path(self.config_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        data = json.dumps(payload, ensure_ascii=False, indent=2)
+        target = Path(self.config_path)
+        # Atomic write: unique temp file in the same dir, then os.replace.
+        # Concurrent writers (event loop + worker threads) can't interleave
+        # or observe a half-written config.
+        with _CONFIG_SAVE_LOCK:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_name, target)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
 
 
 def _default_config_path() -> Path:
@@ -157,7 +184,7 @@ def load_settings(path: str | None = None) -> Settings:
             return lowered.get(val.lower(), default)
         return val or default
 
-    port = int(os.environ.get("DEEPSEAPORT_PORT", raw.get("port", DEFAULT_PORT)))
+    port = _int("DEEPSEAPORT_PORT", "port", DEFAULT_PORT)
     return Settings(
         keys=keys,
         accounts=accounts,
