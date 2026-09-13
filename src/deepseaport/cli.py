@@ -10,17 +10,210 @@ import sys
 import uvicorn
 
 
+def _watch_stop_keys(server) -> None:
+    """Daemon: Esc/q stops a running server so TUI returns to menu.
+
+    Best-effort, never raises. Ctrl+C is handled by uvicorn/SIGINT;
+    this adds Esc (and q) without Enter on Windows (msvcrt) and POSIX.
+    """
+    try:
+        try:
+            import msvcrt  # type: ignore
+        except ImportError:
+            msvcrt = None  # type: ignore
+        if msvcrt is not None:
+            import time as _time
+
+            while not getattr(server, "should_exit", False):
+                try:
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getch()
+                        if ch in (b"\x1b", b"q", b"Q", b"\x03"):
+                            print("\nStopping server (key pressed), returning to menu...")
+                            server.should_exit = True
+                            break
+                    else:
+                        _time.sleep(0.1)
+                except Exception:
+                    return
+            return
+        # POSIX fallback: cbreak stdin + select, restore on exit.
+        import select as _select
+        import sys as _sys
+
+        try:
+            import termios as _termios
+            import tty as _tty
+        except ImportError:
+            return
+        try:
+            _fd = _sys.stdin.fileno()
+        except Exception:
+            return
+        try:
+            _old = _termios.tcgetattr(_fd)
+        except Exception:
+            return
+        try:
+            _tty.setcbreak(_fd)
+            while not getattr(server, "should_exit", False):
+                try:
+                    _r, _, _ = _select.select([_sys.stdin], [], [], 0.2)
+                except Exception:
+                    return
+                if _r:
+                    try:
+                        _ch = _sys.stdin.read(1)
+                    except Exception:
+                        return
+                    if _ch in ("\x1b", "q", "Q"):
+                        print("\nStopping server (key pressed), returning to menu...")
+                        server.should_exit = True
+                        break
+        except Exception:
+            pass
+        finally:
+            try:
+                _termios.tcsetattr(_fd, _termios.TCSADRAIN, _old)
+            except Exception:
+                pass
+    except Exception:
+        return
+
+
+def _is_port_free(host: str, port: int) -> bool:
+    """True when host:port can be bound right now (pre-flight check)."""
+    import socket
+
+    family = socket.AF_INET6 if ":" in (host or "") else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except OSError:
+            pass
+        sock.bind((host, int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _resolve_bind_host(settings, args=None) -> str:
+    """--host flag wins; else listen=true -> 0.0.0.0, false -> 127.0.0.1."""
+    override = ""
+    if args is not None:
+        override = (getattr(args, "host", "") or "").strip()
+    if override:
+        return override
+    return "0.0.0.0" if bool(getattr(settings, "listen", False)) else "127.0.0.1"
+
+
+def _scan_free_ports(host: str, start: int, count: int,
+                     limit: int | None = None, check=None) -> list[int]:
+    """Collect up to `count` free ports scanning upward from `start`.
+
+    Stops at `start+limit-1` when limit is given, else 65535. `check` defaults
+    to _is_port_free. Returns fewer than `count` when the range is exhausted.
+    """
+    free_fn = check if check is not None else _is_port_free
+    try:
+        candidate = int(start)
+    except (TypeError, ValueError):
+        candidate = 5001
+    if candidate < 1:
+        candidate = 1
+    end = 65535 if limit is None else min(65535, candidate + int(limit) - 1)
+    ports: list[int] = []
+    while len(ports) < count and candidate <= end:
+        try:
+            free = bool(free_fn(host, candidate))
+        except Exception:
+            free = False
+        if free:
+            ports.append(candidate)
+        candidate += 1
+    return ports
+
+
+def _next_free_port(host: str, port: int, limit: int = 50) -> int | None:
+    """Scan port+1..port+limit for a free port. None when all busy."""
+    found = _scan_free_ports(host, int(port) + 1, 1, limit=limit)
+    return found[0] if found else None
+
+
+def _ensure_free_port(settings, host: str, port: int) -> int:
+    """Port auto-fix: busy port offers next free one and saves it.
+
+    Interactive (tty stdin): asks Y/n. Non-interactive: auto-picks next
+    free when available. Returns the port to use (original when user
+    declines or no free port found).
+    """
+    import sys as _sys
+
+    port = int(port)
+    if _is_port_free(host, port):
+        return port
+    nxt = _next_free_port(host, port)
+    if nxt is None:
+        print(f"Port {port} busy and no free port found nearby.")
+        return port
+    try:
+        interactive = bool(_sys.stdin.isatty())
+    except Exception:
+        interactive = False
+    if interactive:
+        try:
+            ans = input(f"Port {port} busy. Use {nxt} instead? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return port
+        if ans not in ("", "y", "yes"):
+            return port
+    else:
+        print(f"Port {port} busy, auto-using {nxt}.")
+    settings.port = int(nxt)
+    try:
+        settings.save()
+        print(f"Port -> {nxt} (saved)")
+    except Exception:
+        print(f"Port -> {nxt} (unsaved)")
+    return int(nxt)
+
+
 def _run_server(settings, args) -> int:
     from .server import apply_log_level, create_app
+
+    import threading
 
     apply_log_level(getattr(settings, "log_level", "INFO"))
     app = create_app(settings)
     # --host flag overrides config; else listen=true -> 0.0.0.0, false -> 127.0.0.1.
-    host = (getattr(args, "host", "") or "").strip() or (
-        "0.0.0.0" if bool(getattr(settings, "listen", False)) else "127.0.0.1")
-    uvicorn.run(app, host=host, port=settings.port,
-                log_level=str(getattr(settings, "log_level", "info")).lower(),
-                workers=getattr(args, "workers", 1) or 1)
+    host = _resolve_bind_host(settings, args)
+    port = int(getattr(settings, "port", 5001))
+    log_level = str(getattr(settings, "log_level", "info")).lower()
+    workers = int(getattr(args, "workers", 1) or 1)
+    port = _ensure_free_port(settings, host, port)
+    if workers != 1:
+        # Multi-worker spawns subprocesses; Esc listener can't reach them.
+        # Ctrl+C still stops; TUI main_menu loop returns to menu.
+        try:
+            uvicorn.run(app, host=host, port=port,
+                        log_level=log_level, workers=workers)
+        except KeyboardInterrupt:
+            print("\nServer stopped, back to menu.")
+        return 0
+    config = uvicorn.Config(app, host=host, port=port, log_level=log_level)
+    server = uvicorn.Server(config)
+    threading.Thread(target=_watch_stop_keys, args=(server,), daemon=True).start()
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        print("\nServer stopped (Ctrl+C), back to menu.")
     return 0
 
 
@@ -38,7 +231,15 @@ def cmd_serve(args) -> int:
         def serve_fn(current_settings) -> int:
             return _run_server(current_settings, args)
 
-        return main_menu(settings, serve_fn)
+        def chat_fn(current_settings) -> int:
+            from .chat_ui import run_chat_server
+            return run_chat_server(current_settings, args)
+
+        def multi_fn(current_settings) -> int:
+            from .chat_ui import run_multi_chat_servers
+            return run_multi_chat_servers(current_settings, args)
+
+        return main_menu(settings, serve_fn, chat_fn, multi_fn)
     return _run_server(settings, args)
 
 
@@ -84,11 +285,27 @@ def cmd_accounts(args) -> int:
             print("pool empty")
             print(TOKEN_HELP)
             return 0
+        try:
+            from .accounts import ban_label_for as _ban_lookup, collect_ban_labels as _ban_map
+            from .protocol import format_ban_label as _ban_label
+            ban_map = _ban_map(settings.accounts) or {}
+        except Exception:
+            ban_map = {}
+            _ban_lookup = None  # type: ignore
+            _ban_label = None  # type: ignore
         for i, r in enumerate(rows, 1):
             mark = " *CURRENT*" if r.get("current") else ""
             token_flag = "yes" if _account_has_token(settings, str(r["identifier"])) else "MISSING"
+            ban_flag = ""
+            try:
+                found, until = (_ban_lookup(ban_map, str(r["identifier"]))
+                                if _ban_lookup else (False, None))
+                if found:
+                    ban_flag = f"  {_ban_label(until)}" if _ban_label else "  (BANNED)"
+            except Exception:
+                ban_flag = ""
             print(f"{i}. {r['identifier']}{mark}  uses={r['uses']}  "
-                  f"busy={r['busy']}  cooldown={r['cooldown_remaining']}s  token={token_flag}")
+                  f"busy={r['busy']}  cooldown={r['cooldown_remaining']}s  token={token_flag}{ban_flag}")
         missing = [r["identifier"] for r in rows if not _account_has_token(settings, str(r["identifier"]))]
         if missing:
             print(f"missing token: {', '.join(missing)}")
@@ -121,51 +338,34 @@ def cmd_accounts(args) -> int:
             return 2
         pool = AccountPool(settings.accounts, current=settings.active_account)
         try:
-            pool.add(cfg)
+            from .accounts import add_account as _add
+            _add(settings, pool, cfg)
         except ValueError as exc:
             print(f"add failed: {exc}")
             return 1
-        settings.accounts.append(cfg)
-        if len(settings.accounts) == 1:
-            settings.active_account = cfg.identifier
         settings.save()
         print(f"added {cfg.identifier} -> {settings.config_path}")
         if not cfg.token:
             print("WARNING: no token. Password-only fails (RISK_DEVICE_DETECTED).")
-            print("TIP: python -m deepseaport accounts login --email "
+            print("TIP: python -m deepseaport login --email "
                   f"{cfg.email or cfg.mobile or ''} (auto-capture)")
             print(TOKEN_HELP)
         return 0
 
     if action == "set-token":
-        from .accounts import _matches as _m
+        from .accounts import set_account_token as _set
         token = extract_token(args.token or "")
         if not args.identifier or not token:
             print("usage: accounts set-token <email> --token <userToken value>")
             print(TOKEN_HELP)
             return 2
-        for a in settings.accounts:
-            if _m(a, args.identifier):
-                a.token = token
-                settings.save()
-                print(f"token updated for {a.identifier}")
-                return 0
+        matched = _set(settings, args.identifier, token)
+        if matched is not None:
+            settings.save()
+            print(f"token updated for {matched.identifier}")
+            return 0
         print(f"not found: {args.identifier}")
         return 1
-
-    if action == "login":
-        # Auto-capture token via Obscura, upsert into pool.
-        email = args.email or ""
-        if not email:
-            print("need --email")
-            return 2
-        token = _obscura_login_token(email, args.password or "", settings)
-        if not token:
-            return 3
-        _upsert_account(settings, email, args.password or "", token)
-        settings.save()
-        print(f"login ok, token saved for {email} -> {settings.config_path}")
-        return 0
 
     if action == "remove":
         identifier = args.identifier or ""
@@ -177,18 +377,8 @@ def cmd_accounts(args) -> int:
             print(f"not found: {identifier}")
             return 1
         # Keep config file in sync with pool.
-        kept = []
-        removed = False
-        for a in settings.accounts:
-            from .accounts import _matches as _m
-            if not removed and _m(a, identifier):
-                removed = True
-                continue
-            kept.append(a)
-        settings.accounts = kept
-        if settings.active_account and not any(
-                _m(a, settings.active_account) for a in settings.accounts):
-            settings.active_account = ""
+        from .accounts import remove_account as _remove
+        _remove(settings, identifier)
         settings.save()
         print(f"removed {identifier}")
         return 0
@@ -204,11 +394,8 @@ def cmd_accounts(args) -> int:
 
 
 def _account_has_token(settings, identifier: str) -> bool:
-    from .accounts import _matches as _m
-    for a in settings.accounts:
-        if _m(a, identifier):
-            return bool(a.token)
-    return False
+    from .accounts import account_has_token
+    return account_has_token(settings, identifier)
 
 
 def _upsert_account(settings, email: str, password: str, token: str) -> None:
@@ -225,8 +412,8 @@ def _upsert_account(settings, email: str, password: str, token: str) -> None:
             return
     cfg = AccountConfig(email=email, password=password, token=token)
     settings.accounts.append(cfg)
-    if len(settings.accounts) == 1 and not getattr(settings, "active_account", ""):
-        settings.active_account = cfg.identifier
+    # New account becomes CURRENT (default) immediately.
+    settings.active_account = cfg.identifier
 
 
 def _obscura_login_token(email: str, password: str, settings) -> str | None:
@@ -236,36 +423,41 @@ def _obscura_login_token(email: str, password: str, settings) -> str | None:
 
     from .accounts import extract_token
     from .mcp_client import McpClient
-    from .obscura_bridge import ObscuraBridge
+    from .obscura_bridge import ObscuraBridge, profile_lock
 
-    _ = ObscuraBridge(settings.obscura_bin, settings.obscura_profile)
-    bridge_probe = ObscuraBridge(settings.obscura_bin, settings.obscura_profile)
-    client = McpClient(bridge_probe.binary, bridge_probe.profile)
-    try:
-        client.call("browser_navigate", {"url": "https://chat.deepseek.com/sign_in", "waitUntil": "load"})
-        time.sleep(3)
-        client.call("browser_interactive_elements", {"limit": 40})
-        client.call("browser_fill", {"ref": "e1", "value": email})
-        client.call("browser_fill", {"ref": "e2", "value": password})
-        client.call("browser_click", {"ref": "e8"})
-        for _ in range(24):
-            time.sleep(5)
-            res = client.call("browser_evaluate", {
-                "expression": "JSON.stringify({url:location.href, tok:localStorage.getItem('userToken')})"})
-            try:
-                raw = _json.loads(res["content"][0]["text"]).get("tok") or "null"
-                token = extract_token(raw)
-                if token:
-                    return token
-            except Exception:
-                pass
-        print("login failed: no token captured (captcha or bad credentials?)")
-        print("MANUAL fallback: login in Chrome, F12 > Application > Local Storage >")
-        print("  https://chat.deepseek.com > userToken > copy `value`, then:")
-        print(f"  python -m deepseaport accounts set-token {email} --token <value>")
-        return None
-    finally:
-        client.close()
+    bridge = ObscuraBridge(settings.obscura_bin, settings.obscura_profile)
+    # Login drives a long-lived MCP browser on the SAME --storage-dir the app
+    # bridge uses for WAF warmups. Without the shared profile lock, a
+    # concurrent 403 warmup/token refresh could spawn a second obscura on that
+    # dir and corrupt the cookie jar (=> every subsequent request 403s). Hold
+    # the lock for the whole MCP subprocess lifetime.
+    with profile_lock(bridge.profile):
+        client = McpClient(bridge.binary, bridge.profile)
+        try:
+            client.call("browser_navigate", {"url": "https://chat.deepseek.com/sign_in", "waitUntil": "load"})
+            time.sleep(3)
+            client.call("browser_interactive_elements", {"limit": 40})
+            client.call("browser_fill", {"ref": "e1", "value": email})
+            client.call("browser_fill", {"ref": "e2", "value": password})
+            client.call("browser_click", {"ref": "e8"})
+            for _ in range(24):
+                time.sleep(5)
+                res = client.call("browser_evaluate", {
+                    "expression": "JSON.stringify({url:location.href, tok:localStorage.getItem('userToken')})"})
+                try:
+                    raw = _json.loads(res["content"][0]["text"]).get("tok") or "null"
+                    token = extract_token(raw)
+                    if token:
+                        return token
+                except Exception:
+                    pass
+            print("login failed: no token captured (captcha or bad credentials?)")
+            print("MANUAL fallback: login in Chrome, F12 > Application > Local Storage >")
+            print("  https://chat.deepseek.com > userToken > copy `value`, then:")
+            print(f"  python -m deepseaport accounts set-token {email} --token <value>")
+            return None
+        finally:
+            client.close()
 
 
 def cmd_login(args) -> int:
@@ -291,7 +483,7 @@ def cmd_chat(args) -> int:
     from .accounts import AccountPool
     from .config import load_settings
     from .obscura_bridge import ObscuraBridge
-    from .server import _prepare, _run_completion, create_app
+    from .server import _complete_with_failover_sync, _prepare, create_app
 
     settings = load_settings(args.config)
     app = create_app(settings)
@@ -299,11 +491,11 @@ def cmd_chat(args) -> int:
     app.state.bridge.warmup()
     prep = _prepare({"model": args.model, "messages": [{"role": "user", "content": args.prompt}]}, settings)
     pool = AccountPool(settings.accounts, current=settings.active_account)
-    item = pool.acquire(timeout=30)
-    try:
-        result = _run_completion(app, item, prep)
-    finally:
-        AccountPool.release(item)
+    item = pool.acquire(timeout=30,
+                        allow_failover=bool(getattr(settings, "use_multiple_accounts", True)))
+    # Same-request ban failover as the server endpoint: a banned CURRENT
+    # transparently retries on the next unbanned account.
+    result = _complete_with_failover_sync(app, pool, prep, item)
     print(("THINKING:\n" + result["thinking"] + "\n\n" if result["thinking"] else "") + result["content"])
     return 0
 
@@ -339,9 +531,6 @@ def main(argv: list[str] | None = None) -> int:
     acc_st.add_argument("identifier", help="email/mobile/identifier")
     acc_st.add_argument("--token", default="", required=True,
                         help="userToken value (raw 64-char or full JSON)")
-    acc_li = acc_sub.add_parser("login", help="auto-capture token via Obscura browser")
-    acc_li.add_argument("--email", default="", required=True)
-    acc_li.add_argument("--password", default="")
     acc_rm = acc_sub.add_parser("remove", help="delete account from pool")
     acc_rm.add_argument("identifier", help="email/mobile/identifier/token")
     acc_sub.add_parser("unblock", help="hint for clearing in-memory cooldown")

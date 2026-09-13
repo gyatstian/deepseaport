@@ -13,7 +13,9 @@ from . import protocol as P
 
 logger = logging.getLogger("deepseaport.client")
 
-IMPERSONATE = "chrome"
+# Backwards-compatible alias: the fingerprint lives in protocol as the single
+# source shared with the account pool.
+IMPERSONATE = P.IMPERSONATE
 # Per-request stream timeout. curl_cffi treats this as a low-speed/stall
 # timeout for streaming (read timeout), not a hard wall-clock cap, but keep it
 # large enough for long reasoning generations. The server's consumer wait is
@@ -29,14 +31,16 @@ _SESSION = crequests.Session(impersonate=IMPERSONATE, discard_cookies=True)
 
 
 def _json(resp) -> dict:
-    try:
-        return resp.json()
-    except Exception:
-        return {}
+    return P.parse_json(resp)
 
 
 def _biz_error(data: dict) -> tuple[str, str] | None:
-    """Return (code, msg) when the envelope carries a biz error."""
+    """Return (code, msg) when the envelope carries a biz error.
+
+    Ban/mute envelopes (biz_code 5, "user is muted") embed
+    biz_data {is_muted, mute_until}: the expiry is appended so callers
+    surface "suspended until 16 September 2026 12:49" instead of a bare code.
+    """
     if not isinstance(data, dict):
         return None
     inner = data.get("data")
@@ -48,7 +52,56 @@ def _biz_error(data: dict) -> tuple[str, str] | None:
         msg = data.get("msg", "")
     if code in (0, "0", None, ""):
         return None
-    return str(code), str(msg or "")
+    code_s, msg_s = str(code), str(msg or "")
+    # Attach ban expiry when present (completion ban carries it here).
+    try:
+        if P.is_ban_payload(data):
+            ts = P.extract_ban_timestamp(data)
+            if ts is not None:
+                msg_s = f"{msg_s} (suspended until {P.format_ban_datetime(ts)})".strip()
+    except Exception:
+        pass
+    return code_s, msg_s
+
+
+def fetch_current_user(headers: dict, timeout: int = 20) -> dict:
+    """GET users/current. Raw envelope; caller parses ban/invalid itself."""
+    resp = _SESSION.get(P.USERS_CURRENT_URL, headers=headers,
+                        impersonate=IMPERSONATE, timeout=timeout)
+    return _json(resp)
+
+
+def check_ban(headers: dict, timeout: int = 20) -> tuple[bool, float | None]:
+    """Return (is_banned, mute_until). Invalid token (40003) -> (False, None).
+
+    Uses users/current chat.{is_muted,mute_until}. Best-effort: network or
+    shape failures return (False, None), never raise.
+    """
+    try:
+        data = fetch_current_user(headers, timeout=timeout)
+        if not isinstance(data, dict):
+            return False, None
+        # Invalid/expired token is not a ban — just unauthenticated.
+        code = data.get("code")
+        inner = data.get("data")
+        if code in (40003, "40003"):
+            return False, None
+        if isinstance(inner, dict) and inner.get("biz_code") in (40003, "40003"):
+            return False, None
+        if P.is_ban_payload(data):
+            return True, P.extract_ban_timestamp(data)
+        # Explicit non-muted chat shape also means not banned.
+        try:
+            biz = (inner or {}).get("biz_data", {}) if isinstance(inner, dict) else {}
+            chat = biz.get("chat") if isinstance(biz, dict) else None
+            if isinstance(chat, dict) and "is_muted" in chat:
+                return bool(chat.get("is_muted") in (1, True, "1")), P.extract_ban_timestamp(data)
+        except Exception:
+            pass
+        return False, None
+    except Exception as exc:
+        logger.debug("check_ban ignored: %s", exc)
+        return False, None
 
 
 def create_session(headers: dict) -> str:
@@ -89,8 +142,8 @@ def fetch_pow(headers: dict) -> dict:
     return challenge
 
 
-def solve_pow(headers: dict) -> str:
-    challenge = fetch_pow(headers)
+def solve_challenge(challenge: dict) -> str:
+    """Solve an already-fetched PoW challenge; return the X-DS-PoW-Response value."""
     t0 = time.time()
     answer = PoW.solve(
         challenge.get("algorithm", PoW.ALGORITHM),
@@ -104,19 +157,82 @@ def solve_pow(headers: dict) -> str:
     return PoW.build_header(challenge)
 
 
+def solve_pow(headers: dict) -> str:
+    return solve_challenge(fetch_pow(headers))
+
+
+def _ban_stream_event(data) -> P.StreamEvent | None:
+    """Map a completion envelope to an error StreamEvent, else None.
+
+    Handles the repeated biz-error / ban-payload sequence:
+      - biz error present -> error event (ban expiry attached by _biz_error)
+      - ban payload but no biz code -> explicit ban event (code "5")
+    """
+    if not isinstance(data, dict):
+        return None
+    err = _biz_error(data)
+    if err:
+        ban_ts = P.extract_ban_timestamp(data) if P.is_ban_payload(data) else None
+        return P.StreamEvent(kind="error", code=err[0], message=err[1],
+                             ban_until=ban_ts)
+    if P.is_ban_payload(data):
+        ts = P.extract_ban_timestamp(data)
+        return P.StreamEvent(kind="error", code="5",
+                             message=P.ban_message(ts), ban_until=ts)
+    return None
+
+
 def stream_completion(headers: dict, payload: dict,
                       timeout: int = DEFAULT_TIMEOUT) -> Iterator[P.StreamEvent]:
     """POST completion and yield parsed events. Caller must close on break."""
+    import json as _jsonlib
+
     resp = _SESSION.post(P.COMPLETION_URL, headers=headers, json=payload,
                          impersonate=IMPERSONATE, timeout=timeout, stream=True)
     if resp.status_code == 200 and "text/event-stream" not in (resp.headers.get("content-type", "") or ""):
-        # Some errors arrive as JSON with HTTP 200.
+        # Some errors arrive as JSON with HTTP 200 (e.g. ban:
+        # biz_code 5 "user is muted" + mute_until). With stream=True the body
+        # is not buffered, so resp.json() is empty — drain via iter_lines.
         data = _json(resp)
-        err = _biz_error(data)
-        resp.close()
-        if err:
-            yield P.StreamEvent(kind="error", code=err[0], message=err[1])
+        event = _ban_stream_event(data) if data else None
+        if event is not None:
+            resp.close()
+            yield event
             return
+        # Streaming mode: body arrives as raw JSON lines, not SSE "data:".
+        try:
+            chunks: list[str] = []
+            for raw in resp.iter_lines():
+                if not raw:
+                    continue
+                chunks.append(raw.decode("utf-8", errors="replace")
+                              if isinstance(raw, bytes) else str(raw))
+                if sum(len(c) for c in chunks) > 20000:
+                    break
+            resp.close()
+            if chunks:
+                body = "".join(chunks).strip()
+                try:
+                    data2 = _jsonlib.loads(body)
+                except Exception:
+                    data2 = {}
+                event2 = _ban_stream_event(data2) if isinstance(data2, dict) else None
+                if event2 is not None:
+                    yield event2
+                    return
+                if body:
+                    yield P.StreamEvent(kind="error", code="UPSTREAM_ERROR",
+                                        message=body[:300])
+                    return
+        except StopIteration:
+            pass
+        except Exception:
+            pass
+        try:
+            resp.close()
+        except Exception:
+            pass
+        # Fall through to SSE loop (empty body closes without events).
     if resp.status_code != 200:
         body = resp.text[:300] if not resp.headers.get("content-type", "").startswith("text/") else ""
         code = "HTTP_403_WAF" if resp.status_code == 403 else f"HTTP_{resp.status_code}"
@@ -129,6 +245,19 @@ def stream_completion(headers: dict, payload: dict,
             if not raw:
                 continue
             line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+            # Raw JSON ban can also arrive inside an event-stream body.
+            stripped = line.strip()
+            if not stripped.startswith("data:") and stripped.startswith("{"):
+                try:
+                    data3 = _jsonlib.loads(stripped)
+                except Exception:
+                    data3 = None
+                if isinstance(data3, dict):
+                    event3 = _ban_stream_event(data3)
+                    if event3 is not None:
+                        yield event3
+                        return
+                continue
             for event in parser.feed(line):
                 yield event
                 if event.kind in ("finished", "error"):

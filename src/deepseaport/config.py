@@ -64,8 +64,14 @@ class Settings:
     auto_delete_session: bool = True
     max_retries: int = 1
     parallel_challenge_fetch: bool = True
+    # True -> busy CURRENT fails over to another healthy account (parallel
+    # subagents / multitasking). False -> stick to CURRENT, queue on it.
+    use_multiple_accounts: bool = True
     log_level: str = "INFO"
-    stream_mode: str = "buffered"
+    stream_mode: str = "live"
+    # Last /model picked in server-with-chat mode. Validated in chat_ui
+    # (MODELS lives in server.py; importing it here would cycle).
+    chat_model: str = "deepseek-flash"
 
     def save(self) -> None:
         if not self.config_path:
@@ -86,14 +92,17 @@ class Settings:
             "auto_delete_session": self.auto_delete_session,
             "max_retries": self.max_retries,
             "parallel_challenge_fetch": self.parallel_challenge_fetch,
+            "use_multiple_accounts": self.use_multiple_accounts,
             "log_level": self.log_level,
             "stream_mode": self.stream_mode,
+            "chat_model": self.chat_model,
         }
         data = json.dumps(payload, ensure_ascii=False, indent=2)
         target = Path(self.config_path)
         # Atomic write: unique temp file in the same dir, then os.replace.
         # Concurrent writers (event loop + worker threads) can't interleave
-        # or observe a half-written config.
+        # or observe a half-written config. If the rename is blocked (see
+        # below) we degrade to an in-place rewrite.
         with _CONFIG_SAVE_LOCK:
             target.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_name = tempfile.mkstemp(
@@ -103,13 +112,22 @@ class Settings:
                     fh.write(data)
                     fh.flush()
                     os.fsync(fh.fileno())
-                os.replace(tmp_name, target)
-            except BaseException:
                 try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
-                raise
+                    os.replace(tmp_name, target)
+                    tmp_name = None
+                except PermissionError:
+                    # Windows: an external handle (editor, antivirus, another
+                    # process) can block the rename even though in-place writes
+                    # are allowed, because rename needs FILE_SHARE_DELETE on
+                    # every open handle. Fall back to a direct overwrite; the
+                    # save lock still serializes our own writers.
+                    target.write_text(data, encoding="utf-8")
+            finally:
+                if tmp_name:
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
 
 
 def _default_config_path() -> Path:
@@ -201,6 +219,9 @@ def load_settings(path: str | None = None) -> Settings:
         max_retries=_int("DEEPSEAPORT_MAX_RETRIES", "max_retries", 1),
         parallel_challenge_fetch=_bool(
             "DEEPSEAPORT_PARALLEL_FETCH", "parallel_challenge_fetch", True),
+        use_multiple_accounts=_bool(
+            "DEEPSEAPORT_USE_MULTIPLE_ACCOUNTS", "use_multiple_accounts", True),
         log_level=_str("DEEPSEAPORT_LOG_LEVEL", "log_level", "INFO", VALID_LOG_LEVELS),
-        stream_mode=_str("DEEPSEAPORT_STREAM_MODE", "stream_mode", "buffered", VALID_STREAM_MODES),
+        stream_mode=_str("DEEPSEAPORT_STREAM_MODE", "stream_mode", "live", VALID_STREAM_MODES),
+        chat_model=_str("DEEPSEAPORT_CHAT_MODEL", "chat_model", "deepseek-flash"),
     )

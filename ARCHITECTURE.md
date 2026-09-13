@@ -109,9 +109,48 @@ Only these four; no Pro/expert exists yet (flash superseded v4 Pro):
 `model_type` stays `"default"`. Removed: `deepseek-chat/v3/r1`, `-search`
 variants under old names, `deepseek-vision`.
 
+## TUI / serve modes (`tui.py`, `chat_ui.py`, `cli.py`)
+
+- `main_menu` loop: `1 Start server`, `2 Start server with chat`
+  (chat arg omitted → legacy 1-3 layout), `Settings`, `Accounts`, `q Quit`.
+  Both serve paths return to the menu on stop — no app restart to switch
+  accounts; API-side account changes are reloaded from disk afterwards
+  (`_refresh_from_disk`).
+- Pre-flight guard (`_preflight_reason`): Start is blocked when the pool is
+  empty or no account has a token (first request would 503/401). The menu
+  prints why and jumps into `accounts_menu` so the fix is one step away.
+- Plain serve (`cli._run_server`, single worker): `uvicorn.Server` in the
+  main thread + `_watch_stop_keys` daemon (`msvcrt` on Windows,
+  `termios`+`select` on POSIX) mapping `Esc`/`q` to `server.should_exit`;
+  `Ctrl+C` arrives via SIGINT. Multi-worker falls back to `uvicorn.run`
+  (no Esc listener — it can't reach subprocesses).
+- Port auto-fix (`cli._ensure_free_port`): socket pre-check; busy port scans
+  `port+1..port+50`, asks `Y/n` on a tty (auto-picks headless), writes the
+  winner to `settings.port` + `config.json`.
+- Server-with-chat (`chat_ui.py`, stdlib only): same API server in a
+  background thread (`log_level=error`, `access_log=False`) + blocking
+  `input()` REPL in front posting non-stream completions to
+  `127.0.0.1:port` (Bearer = first `settings.keys` entry when set).
+  Commands: `/model [name]`, `/clear`, `/quit|/exit`, `/help`.
+- Chat log silence: `_silence_chat_logs()` raises `deepseaport.*`,
+  `uvicorn*` and root to `ERROR` before the server thread starts, and
+  `settings.log_level` is overridden to `ERROR` in-memory (never saved) so
+  the lifespan's `apply_log_level()` stays quiet too (this is what used to
+  spray `deepseaport.obscura` warmup INFO across the `You:` line). Levels
+  are restored on every exit path, including failed start.
+- Chat model memory: `/model` persists to `settings.chat_model`
+  (`config.json` + `DEEPSEAPORT_CHAT_MODEL` env); unknown/empty values fall
+  back to `deepseek-flash` (`_initial_chat_model`).
+- Accounts TUI: `Token (y = auto-token)` — `y` runs Obscura auto-login
+  (`confirmed=True`, no second prompt), anything else is a literal token.
+  New accounts become `CURRENT` immediately (TUI, CLI `accounts add`,
+  `POST /v1/accounts`, login upsert).
+
 ## Environment / files
 
-- `config.json` (gitignored): `{keys, accounts[{email,mobile,password,token}], obscura_bin, obscura_profile, port, listen}`.
+- `config.json` (gitignored): `{keys, accounts[{email,mobile,password,token}], active_account, obscura_bin, obscura_profile, port, listen, enable_tools, warmup_on_startup, auto_delete_session, max_retries, parallel_challenge_fetch, use_multiple_accounts, log_level, stream_mode, chat_model}`.
+  `use_multiple_accounts` (default true): busy/cooldown CURRENT fails over to
+  another healthy account (parallel subagents); false pins requests to CURRENT.
   `listen: true` binds `0.0.0.0` (LAN); default false binds `127.0.0.1`; `--host` overrides.
 - `data/` (gitignored): PoW wasm. `~/.deepseaport/obscura-profile`: WAF cookies + login localStorage.
 - `src/deepseaport/mcp_client.py` is used by `deepseaport login` only, not the hot path.

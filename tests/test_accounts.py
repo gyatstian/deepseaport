@@ -287,8 +287,8 @@ def test_tui_add_skip_token_offers_auto_login(monkeypatch):
     from deepseaport.tui import accounts_menu
 
     s = Settings(accounts=[], active_account="", config_path="")
-    # a -> add flow: email, password, token(skip), auto-login Y.
-    inputs = iter(["a", "new@x.com", "pw", "", "y", "b"])
+    # a -> add flow: email, password, token(y = auto-token).
+    inputs = iter(["a", "new@x.com", "pw", "y", "b"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     monkeypatch.setattr("deepseaport.cli._obscura_login_token",
                         lambda email, password, settings: "auto-tok-123")
@@ -296,3 +296,30 @@ def test_tui_add_skip_token_offers_auto_login(monkeypatch):
     assert len(s.accounts) == 1
     assert s.accounts[0].token == "auto-tok-123"
     assert s.active_account == "new@x.com"
+
+
+def test_tui_add_non_y_token_is_literal(monkeypatch):
+    from deepseaport.config import Settings
+    from deepseaport.tui import accounts_menu
+
+    s = Settings(accounts=[], active_account="", config_path="")
+    inputs = iter(["a", "new@x.com", "pw", "mytoken123", "b"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+    accounts_menu(s)
+    assert len(s.accounts) == 1
+    assert s.accounts[0].token == "mytoken123"
+    # New account becomes CURRENT (default) immediately.
+    assert s.active_account == "new@x.com"
+
+
+def test_tui_add_second_account_becomes_default(monkeypatch):
+    from deepseaport.config import AccountConfig, Settings
+    from deepseaport.tui import accounts_menu
+
+    s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1")],
+                 active_account="a@x.com", config_path="")
+    inputs = iter(["a", "b@x.com", "pw", "tok2", "b"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+    accounts_menu(s)
+    assert len(s.accounts) == 2
+    assert s.active_account == "b@x.com"

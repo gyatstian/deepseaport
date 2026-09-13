@@ -7,8 +7,8 @@
 - base url: http://127.0.0.1:5001/v1
 
 # notice
-- deepseek on the website feels lobotomized/lazy, though it's not that bad, and you can definitely make it much better with skills or good prompting. it seems the longer the prompt is, the more he thinks<br>
-- tool calling seems ok. sometimes fails on long/complicated ones but he finds a way around<br>
+- deepseek on the website feels lobotomized/lazy, though it's not that bad, and you can definitely make it much better with skills or good prompting. below inside the readme I added a voxel pagoda he made<br>
+- tool calling seems ok. most often fails on long/complicated ones so advise him to implement one by one and it will be ok<br>
 - app needs https://aka.ms/vs/17/release/vc_redist.x64.exe beacuse of obscura
 
 # deepseaport — DeepSeek web2api (Obscura-backed)
@@ -37,7 +37,7 @@ Agentic-harness support:
   per-account locks + rotation; auto session cleanup; PoW/WAF retry once.
 
 ## Quickstart
-**For both:**
+**Setup for both:**
 Obscura binary (`h4ckf0r0day/obscura`, i personally use no-render stealth): drop
 `obscura.exe` next to `config.json` (or under `bin/`, `tools/`,
 `vendor/`, `obscura-*/`), or set `obscura_bin` / `OBSCURA_BIN`. path also works.
@@ -62,6 +62,15 @@ curl -N http://127.0.0.1:5001/v1/chat/completions `
   -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
+## Showcase
+**prompt used (inside opencode with a short but sharp agent):** Design and create a very creative, elaborate, and detailed voxel art scene of a pagoda in a beautiful garden with trees, including some cherry blossoms. Make the scene impressive and varied and use colorful voxels. Use whatever libraries to get this done but make sure I can paste it all into a single HTML file and open it in Chrome.<br>
+
+<div align="center">
+  <img src="temple.png" alt="temple" width="500">
+</div>
+
+**my opnion:** it looks better than v4 definetly as it has more details but looks much worse than what an actual flash v4.1 can create. it seemed like he just rushed to create it (didn't think about correcting any mistakes after finishing or adding anything further).
+
 ## Config
 
 `config.json` (or env, see `.env.example`):
@@ -70,12 +79,29 @@ curl -N http://127.0.0.1:5001/v1/chat/completions `
 {
   "keys": ["sk-local-dev"],
   "accounts": [{ "email": "you@x.com", "password": "...", "token": "" }],
+  "active_account": "",
   "obscura_bin": "",
   "obscura_profile": "",
   "port": 5001,
-  "listen": false
+  "listen": false,
+  "chat_model": "deepseek-flash"
 }
 ```
+
+`active_account` is the `CURRENT` selection (`""` = auto-failover over the
+whole pool). `chat_model` remembers the last `/model` pick from server-with-chat
+mode (env: `DEEPSEAPORT_CHAT_MODEL`). All remaining behaviour flags
+(`enable_tools`, `warmup_on_startup`, `auto_delete_session`, `max_retries`,
+`parallel_challenge_fetch`, `use_multiple_accounts`, `log_level`,
+`stream_mode`) live in `config.example.json` and are editable from the
+TUI Settings screen.
+
+`use_multiple_accounts` (default `true`, env:
+`DEEPSEAPORT_USE_MULTIPLE_ACCOUNTS`): when `true` and `CURRENT` is busy
+(one in-flight stream per account, enforced by per-account lock) or cooling
+down (banned), the request fails over to another healthy account — this is
+what lets parallel subagents / multitasking share one instance. When
+`false`, requests stick to `CURRENT` and queue on it instead.
 
 `"listen": true` serves on `0.0.0.0` (LAN-visible); default `false` binds
 `127.0.0.1` only. `--host` flag overrides both.

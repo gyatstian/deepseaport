@@ -6,6 +6,7 @@ acquire() fails over to next healthy account.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -20,10 +21,15 @@ from .config import AccountConfig
 
 logger = logging.getLogger("deepseaport.accounts")
 
-IMPERSONATE = "chrome"
+# Backwards-compatible alias: single source in protocol (shared with client).
+IMPERSONATE = P.IMPERSONATE
 LOGIN_TIMEOUT = 30
 COOLDOWN_SECONDS = 120
 _POLL_INTERVAL = 0.05
+# Ban check skips obviously-fake tokens (unit tests use "t1", "tok-...").
+# Real userToken values are 64-char; short ones would only waste a request.
+MIN_TOKEN_LEN_FOR_BAN_CHECK = 20
+BAN_CHECK_TIMEOUT = 12
 
 TOKEN_HELP = (
     "userToken needed per account. Two ways:\n"
@@ -150,6 +156,73 @@ def sync_current_from_settings(pool: AccountPool, settings) -> bool:
     return True
 
 
+def account_has_token(settings, identifier: str) -> bool:
+    """True when settings holds a matching account that carries a token."""
+    for a in (getattr(settings, "accounts", None) or []):
+        if _matches(a, identifier):
+            return bool(a.token)
+    return False
+
+
+def add_account(settings, pool: "AccountPool", cfg: AccountConfig) -> PooledAccount:
+    """Add cfg to pool + settings and make it CURRENT. Raises ValueError on dup."""
+    item = pool.add(cfg)
+    settings.accounts.append(cfg)
+    # New account becomes CURRENT (default) immediately.
+    settings.active_account = cfg.identifier
+    try:
+        pool.set_current(cfg.identifier)
+    except Exception:
+        pass
+    return item
+
+
+def set_account_token(settings, identifier: str, token: str) -> AccountConfig | None:
+    """Set token on the first matching settings account; return it or None."""
+    for a in (getattr(settings, "accounts", None) or []):
+        if _matches(a, identifier):
+            a.token = token
+            return a
+    return None
+
+
+def remove_account(settings, identifier: str) -> bool:
+    """Drop the first matching account from settings; clear stale CURRENT.
+
+    Mirrors AccountPool.remove() ordering. Returns True when one was removed.
+    """
+    kept, dropped = [], False
+    for a in (getattr(settings, "accounts", None) or []):
+        if not dropped and _matches(a, identifier):
+            dropped = True
+            continue
+        kept.append(a)
+    if not dropped:
+        return False
+    settings.accounts = kept
+    if settings.active_account and not any(
+            _matches(a, settings.active_account) for a in settings.accounts):
+        settings.active_account = ""
+    return True
+
+
+def ban_label_for(ban_map: dict, identifier: str) -> tuple[bool, float | None]:
+    """Look up a ban expiry: exact key, then case-insensitive fallback.
+
+    Returns (found, mute_until). found is True when the identifier is banned
+    even if the expiry is unknown (None).
+    """
+    if not ban_map:
+        return False, None
+    if identifier in ban_map:
+        return True, ban_map[identifier]
+    key = str(identifier).strip().lower()
+    for bid, until in ban_map.items():
+        if str(bid).strip().lower() == key:
+            return True, until
+    return False, None
+
+
 class AccountPool:
     def __init__(self, accounts: list[AccountConfig] | None = None,
                  current: str | None = None) -> None:
@@ -254,10 +327,13 @@ class AccountPool:
             logger.info("cooldown cleared for %d account(s)", n)
         return n
 
-    def acquire(self, timeout: float = 60) -> PooledAccount:
+    def acquire(self, timeout: float = 60, allow_failover: bool = True) -> PooledAccount:
         """Return account with lock held. Skips busy + cooldown, round-robin.
 
         CURRENT account (when set) tried first, others fail over after it.
+        When allow_failover=False and CURRENT is in the pool, only CURRENT
+        is considered (sticky: concurrent requests queue on it instead of
+        spreading to other accounts). Busy is per-account lock state.
         Raises ValueError when pool empty, TimeoutError when all busy/cooldown
         for longer than timeout.
         """
@@ -274,8 +350,11 @@ class AccountPool:
             ordered = snapshot[start:] + snapshot[:start]
             if cur:
                 preferred = [it for it in snapshot if _matches(it.cfg, cur)]
-                rest = [it for it in ordered if not _matches(it.cfg, cur)]
-                ordered = preferred + rest
+                if preferred and not allow_failover:
+                    ordered = preferred
+                else:
+                    rest = [it for it in ordered if not _matches(it.cfg, cur)]
+                    ordered = preferred + rest
             for item in ordered:
                 with self._guard:
                     if item not in self._items:
@@ -295,10 +374,55 @@ class AccountPool:
                 raise TimeoutError("no DeepSeek account free (busy or cooldown)")
             time.sleep(min(_POLL_INTERVAL, max(0.001, deadline - time.monotonic())))
 
+    async def aacquire(self, timeout: float = 60, allow_failover: bool = True) -> PooledAccount:
+        """Async acquire: same rotation/skip semantics, no worker thread held.
+
+        Polls with asyncio.sleep so the default executor stays free for real
+        blocking work (challenge fetch, parse, status, save). Used by the
+        async FastAPI endpoint; sync worker threads keep using acquire().
+        allow_failover=False pins to CURRENT (see acquire()).
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._guard:
+                if not self._items:
+                    raise ValueError("no DeepSeek accounts in pool")
+                snapshot = list(self._items)
+                cur = self._current
+                start = self._cursor % len(snapshot)
+                self._cursor += 1
+            now = time.time()
+            ordered = snapshot[start:] + snapshot[:start]
+            if cur:
+                preferred = [it for it in snapshot if _matches(it.cfg, cur)]
+                if preferred and not allow_failover:
+                    ordered = preferred
+                else:
+                    rest = [it for it in ordered if not _matches(it.cfg, cur)]
+                    ordered = preferred + rest
+            for item in ordered:
+                with self._guard:
+                    if item not in self._items:
+                        continue  # removed concurrently
+                if item.bad_until > now:
+                    continue  # on cool -> fail over to next
+                if item.lock.acquire(blocking=False):
+                    with self._guard:
+                        if item not in self._items:
+                            item.lock.release()
+                            continue
+                    if item.bad_until > time.time():
+                        item.lock.release()  # marked bad while racing
+                        continue
+                    return item
+            if time.monotonic() >= deadline:
+                raise TimeoutError("no DeepSeek account free (busy or cooldown)")
+            await asyncio.sleep(min(_POLL_INTERVAL, max(0.001, deadline - time.monotonic())))
+
     @contextmanager
-    def slot(self, timeout: float = 60) -> Iterator[PooledAccount]:
+    def slot(self, timeout: float = 60, allow_failover: bool = True) -> Iterator[PooledAccount]:
         """`with pool.slot() as acc:` auto-release. Simple use path."""
-        item = self.acquire(timeout=timeout)
+        item = self.acquire(timeout=timeout, allow_failover=allow_failover)
         try:
             yield item
         finally:
@@ -333,10 +457,7 @@ def login(cfg: AccountConfig, headers: dict[str, str]) -> str:
 
 
 def _json(resp) -> dict:
-    try:
-        return resp.json()
-    except Exception:
-        return {}
+    return P.parse_json(resp)
 
 
 def _dig(data: dict, path: list[str]):
@@ -346,3 +467,149 @@ def _dig(data: dict, path: list[str]):
             return None
         cur = cur[key]
     return cur
+
+
+def check_ban_for_token(token: str, timeout: int = BAN_CHECK_TIMEOUT) -> tuple[bool, float | None]:
+    """Best-effort ban probe for one token. Never raises; (False, None) on skip/fail.
+
+    Skips empty/short (test) tokens without network. Otherwise GETs
+    users/current and returns (is_banned, mute_until).
+    """
+    tok = (token or "").strip()
+    if len(tok) < MIN_TOKEN_LEN_FOR_BAN_CHECK:
+        return False, None
+    try:
+        # Local import: client pulls curl session, not needed at module import.
+        from . import client as _DS
+
+        headers = P.bridge_headers(bearer=tok)
+        return _DS.check_ban(headers, timeout=timeout)
+    except Exception as exc:
+        logger.debug("ban check ignored: %s", exc)
+        return False, None
+
+
+# TTL cache for ban labels: the TUI menu redraws on every keypress, and a
+# network probe per redraw blocks the menu (2 accounts ~1s, offline up to
+# 12s). Cache for BAN_LABEL_TTL seconds; TUI reads the cache instantly and
+# refreshes in background so menu render never blocks on network.
+BAN_LABEL_TTL = 60.0
+_BAN_CACHE_LOCK = threading.Lock()
+_BAN_CACHE: dict = {"ts": 0.0, "key": None, "result": {}}
+_BAN_REFRESH_INFLIGHT = False
+
+
+def _ban_targets(accounts: list[AccountConfig] | None) -> tuple[tuple[str, str], ...]:
+    """Sorted (identifier, token) pairs worth probing; shared key/normalizer."""
+    try:
+        targets = [((a.identifier or ""), ((a.token or "").strip()))
+                   for a in (accounts or [])]
+        targets = [(i, t) for i, t in targets if len(t) >= MIN_TOKEN_LEN_FOR_BAN_CHECK]
+        return tuple(sorted(targets))
+    except Exception:
+        return ()
+
+
+def _ban_cache_key(accounts: list[AccountConfig] | None) -> tuple:
+    return _ban_targets(accounts)
+
+
+def get_cached_ban_labels(accounts: list[AccountConfig] | None) -> dict[str, float | None]:
+    """Instant, never-network ban labels (may be empty/stale). For menu render."""
+    try:
+        key = _ban_cache_key(accounts)
+        if not key:
+            return {}
+        with _BAN_CACHE_LOCK:
+            if _BAN_CACHE.get("key") != key:
+                return {}
+            return dict(_BAN_CACHE.get("result") or {})
+    except Exception:
+        return {}
+
+
+def refresh_ban_labels_background(accounts: list[AccountConfig] | None,
+                                  timeout: int = BAN_CHECK_TIMEOUT) -> None:
+    """Refresh ban-label cache in a daemon thread unless fresh/refreshing."""
+    global _BAN_REFRESH_INFLIGHT
+    try:
+        key = _ban_cache_key(accounts)
+        if not key:
+            return
+        with _BAN_CACHE_LOCK:
+            if _BAN_REFRESH_INFLIGHT:
+                return
+            try:
+                fresh = ((time.time() - float(_BAN_CACHE.get("ts") or 0)) < BAN_LABEL_TTL
+                         and _BAN_CACHE.get("key") == key)
+            except Exception:
+                fresh = False
+            if fresh:
+                return
+            _BAN_REFRESH_INFLIGHT = True
+        snapshot = list(accounts or [])
+
+        def _run() -> None:
+            global _BAN_REFRESH_INFLIGHT
+            try:
+                collect_ban_labels(snapshot, timeout=timeout, force_refresh=True)
+            except Exception:
+                pass
+            finally:
+                with _BAN_CACHE_LOCK:
+                    _BAN_REFRESH_INFLIGHT = False
+
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception:
+        pass
+
+
+def collect_ban_labels(accounts: list[AccountConfig],
+                       timeout: int = BAN_CHECK_TIMEOUT,
+                       ttl: float = BAN_LABEL_TTL,
+                       force_refresh: bool = False) -> dict[str, float | None]:
+    """Map identifier -> mute_until for banned accounts only (parallel, best-effort).
+
+    Empty dict when none banned, offline, or tokens missing/short. Never raises.
+    Used by TUI/CLI account managers to render red '(BANNED: D Month)'.
+    Results are TTL-cached (default 60s) so menu redraws don't probe network.
+    """
+    import concurrent.futures as _fut
+
+    key = _ban_targets(accounts)
+    targets = list(key)
+    if not targets:
+        return {}
+    if not force_refresh and ttl and ttl > 0:
+        try:
+            with _BAN_CACHE_LOCK:
+                if (_BAN_CACHE.get("key") == key
+                        and (time.time() - float(_BAN_CACHE.get("ts") or 0)) < float(ttl)):
+                    return dict(_BAN_CACHE.get("result") or {})
+        except Exception:
+            pass
+    out: dict[str, float | None] = {}
+
+    def _one(pair: tuple[str, str]) -> tuple[str, bool, float | None]:
+        ident, tok = pair
+        try:
+            banned, until = check_ban_for_token(tok, timeout=timeout)
+            return ident, banned, until
+        except Exception:
+            return ident, False, None
+
+    try:
+        with _fut.ThreadPoolExecutor(max_workers=min(8, len(targets))) as ex:
+            for ident, banned, until in ex.map(_one, targets):
+                if banned:
+                    out[ident] = until
+    except Exception as exc:
+        logger.debug("collect_ban_labels ignored: %s", exc)
+    try:
+        with _BAN_CACHE_LOCK:
+            _BAN_CACHE["key"] = key
+            _BAN_CACHE["ts"] = time.time()
+            _BAN_CACHE["result"] = dict(out)
+    except Exception:
+        pass
+    return out

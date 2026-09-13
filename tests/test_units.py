@@ -202,3 +202,80 @@ def test_prepare_appends_reminder_only_with_tools():
     # tool_choice none disables tools entirely (no prompt change).
     body_none = {**body_tools, "tool_choice": "none"}
     assert _prepare(body_none)["tools"] == []
+
+
+def test_prepare_rejects_malformed_messages_as_400():
+    """Non-list / non-dict messages must 400, not crash render_prompt (500)."""
+    import pytest
+    from fastapi import HTTPException
+
+    from deepseaport.server import _prepare
+
+    for bad in ({"role": "user"}, ["hi"], "hello", [["x"]], [None], 123):
+        with pytest.raises(HTTPException) as exc_info:
+            _prepare({"model": "deepseek-flash", "messages": bad})
+        assert exc_info.value.status_code == 400
+    # Valid shape still renders.
+    ok = _prepare({"model": "deepseek-flash",
+                   "messages": [{"role": "user", "content": "hi"}]})
+    assert ok["prompt"] == "hi"
+
+
+def test_ban_extract_completion_shape():
+    # Live shape: POST completion -> biz_code 5 "user is muted".
+    data = {"code": 0, "msg": "", "data": {"biz_code": 5, "biz_msg": "user is muted",
+            "biz_data": {"is_muted": 1, "mute_until": 1789555791.11}}}
+    assert P.extract_ban_timestamp(data) == 1789555791.11
+    assert P.is_ban_payload(data) is True
+
+
+def test_ban_extract_users_current_shape():
+    # Live shape: GET users/current -> chat.{is_muted,mute_until}.
+    data = {"code": 0, "msg": "", "data": {"biz_code": 0, "biz_msg": "",
+            "biz_data": {"chat": {"is_muted": 1, "mute_until": 1789555791.11}}}}
+    assert P.extract_ban_timestamp(data) == 1789555791.11
+    assert P.is_ban_payload(data) is True
+    # Valid account: not banned.
+    valid = {"code": 0, "msg": "", "data": {"biz_code": 0, "biz_msg": "",
+             "biz_data": {"chat": {"is_muted": 0, "mute_until": None}}}}
+    assert P.extract_ban_timestamp(valid) is None
+    assert P.is_ban_payload(valid) is False
+    # Invalid token is not a ban.
+    invalid = {"code": 40003, "msg": "Authorization Failed (invalid token)", "data": None}
+    assert P.is_ban_payload(invalid) is False
+
+
+def test_ban_format_day_month():
+    label = P.format_ban_label(1789555791.11)
+    assert label.startswith("(BANNED:")
+    assert "16" in label and "September" in label
+    assert P.format_ban_day_month(1789555791.11) == "16 September"
+    assert "16 September 2026" in P.format_ban_datetime(1789555791.11)
+    assert "16 September" in P.ban_message(1789555791.11)
+    assert P.format_ban_label(None) == "(BANNED)"
+
+
+def test_biz_error_includes_ban_expiry():
+    from deepseaport.client import _biz_error
+    data = {"code": 0, "msg": "", "data": {"biz_code": 5, "biz_msg": "user is muted",
+            "biz_data": {"is_muted": 1, "mute_until": 1789555791.11}}}
+    err = _biz_error(data)
+    assert err is not None and err[0] == "5"
+    assert "16 September" in err[1]
+
+
+def test_sse_parser_surfaces_ban():
+    line = ('data: {"code":0,"msg":"","data":{"biz_code":5,"biz_msg":"user is muted",'
+            '"biz_data":{"is_muted":1,"mute_until":1789555791.11}}}')
+    evs = list(P.parse_sse_line(line))
+    assert evs and evs[0].kind == "error"
+    assert "16 September" in evs[0].message
+
+
+def test_ban_check_skips_short_tokens_no_network():
+    from deepseaport.accounts import check_ban_for_token, collect_ban_labels
+    from deepseaport.config import AccountConfig
+    # Short/test tokens never touch network.
+    assert check_ban_for_token("t1") == (False, None)
+    assert check_ban_for_token("") == (False, None)
+    assert collect_ban_labels([AccountConfig(email="a@x.com", token="t1")]) == {}
