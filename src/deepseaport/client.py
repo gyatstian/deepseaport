@@ -10,6 +10,11 @@ from curl_cffi import requests as crequests
 
 from . import pow as PoW
 from . import protocol as P
+from . import transport_http as T
+# Backward-compat re-exports: canonical SSE parsing lives in sse_parser.py,
+# header/payload helpers in protocol.py — still importable from client.
+from .protocol import base_headers, bridge_headers, completion_payload, parse_json  # noqa: F401
+from .sse_parser import StreamEvent, StreamParser, parse_sse_line  # noqa: F401
 
 logger = logging.getLogger("deepseaport.client")
 
@@ -185,11 +190,9 @@ def _ban_stream_event(data) -> P.StreamEvent | None:
 def stream_completion(headers: dict, payload: dict,
                       timeout: int = DEFAULT_TIMEOUT) -> Iterator[P.StreamEvent]:
     """POST completion and yield parsed events. Caller must close on break."""
-    import json as _jsonlib
-
     resp = _SESSION.post(P.COMPLETION_URL, headers=headers, json=payload,
                          impersonate=IMPERSONATE, timeout=timeout, stream=True)
-    if resp.status_code == 200 and "text/event-stream" not in (resp.headers.get("content-type", "") or ""):
+    if resp.status_code == 200 and not T.is_sse_response(resp):
         # Some errors arrive as JSON with HTTP 200 (e.g. ban:
         # biz_code 5 "user is muted" + mute_until). With stream=True the body
         # is not buffered, so resp.json() is empty — drain via iter_lines.
@@ -201,28 +204,18 @@ def stream_completion(headers: dict, payload: dict,
             return
         # Streaming mode: body arrives as raw JSON lines, not SSE "data:".
         try:
-            chunks: list[str] = []
-            for raw in resp.iter_lines():
-                if not raw:
-                    continue
-                chunks.append(raw.decode("utf-8", errors="replace")
-                              if isinstance(raw, bytes) else str(raw))
-                if sum(len(c) for c in chunks) > 20000:
-                    break
+            chunks = T.drain_lines(resp, T.JSON_DRAIN_CAP)
             resp.close()
             if chunks:
                 body = "".join(chunks).strip()
-                try:
-                    data2 = _jsonlib.loads(body)
-                except Exception:
-                    data2 = {}
+                data2 = T.loads_lenient(body)
                 event2 = _ban_stream_event(data2) if isinstance(data2, dict) else None
                 if event2 is not None:
                     yield event2
                     return
                 if body:
                     yield P.StreamEvent(kind="error", code="UPSTREAM_ERROR",
-                                        message=body[:300])
+                                        message=T.truncate_message(body))
                     return
         except StopIteration:
             pass
@@ -234,24 +227,20 @@ def stream_completion(headers: dict, payload: dict,
             pass
         # Fall through to SSE loop (empty body closes without events).
     if resp.status_code != 200:
-        body = resp.text[:300] if not resp.headers.get("content-type", "").startswith("text/") else ""
-        code = "HTTP_403_WAF" if resp.status_code == 403 else f"HTTP_{resp.status_code}"
+        event = T.build_http_error_event(resp, payload)
         resp.close()
-        yield P.StreamEvent(kind="error", code=code, message=body)
+        yield event
         return
     try:
-        parser = P.StreamParser()
+        parser = StreamParser()
         for raw in resp.iter_lines():
             if not raw:
                 continue
-            line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+            line = T.decode_line(raw)
             # Raw JSON ban can also arrive inside an event-stream body.
             stripped = line.strip()
             if not stripped.startswith("data:") and stripped.startswith("{"):
-                try:
-                    data3 = _jsonlib.loads(stripped)
-                except Exception:
-                    data3 = None
+                data3 = T.loads_lenient(stripped)
                 if isinstance(data3, dict):
                     event3 = _ban_stream_event(data3)
                     if event3 is not None:

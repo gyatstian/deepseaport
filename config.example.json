@@ -1,11 +1,21 @@
 {
-  "keys": ["sk-local-dev"],
+  "keys": [
+    "sk-local-dev"
+  ],
   "accounts": [
-    { "email": "", "password": "", "token": "" }
+    {
+      "email": "",
+      "password": "",
+      "token": "",
+      "banned": false,
+      "banned_until": 0.0
+    }
   ],
   "active_account": "",
   "obscura_bin": "",
   "obscura_profile": "",
+  "browser_bin": "auto",
+  "browser_headless": false,
   "port": 5001,
   "listen": false,
   "enable_tools": true,

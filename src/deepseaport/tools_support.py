@@ -15,11 +15,25 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 
 logger = logging.getLogger("deepseaport.tools")
 
-MAX_ARGS_CHARS = 8000
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        return default
+    return val if val > 0 else default
+
+
+MAX_ARGS_CHARS = _int_env("DEEPSEAPORT_MAX_ARGS_CHARS", 8000)
+MAX_BARE_OBJECTS = _int_env("DEEPSEAPORT_MAX_BARE_OBJECTS", 40)
 
 
 def _valid_names(tools: list[dict] | None) -> set[str]:
@@ -64,8 +78,11 @@ def tool_system_prompt(tools: list[dict]) -> str:
         "- Put parallel calls in one array with ids call_001, call_002, ...",
         "- If no tool is needed, answer normally without any JSON.",
         "- After tool results arrive, use them and answer the user.",
-        "- When calling tools: no prose, no Thought:, no Thinking:, no DSML tags,",
-        "  no <||...|> markers before or after the JSON object.",
+        "- Preferred format is the JSON object above (no prose before or after).",
+        "- Alternatives also accepted:",
+        '  <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>,',
+        "  ```json fenced object with tool_calls or name+arguments keys,",
+        "  or <||DSML|| invoke name=...><||DSML|| parameter name=...>...</> blocks (ASCII or fullwidth).",
     ]
     if names:
         lines.append(f"Valid tool names: {', '.join(names)}. Do not invent other names.")
@@ -80,7 +97,8 @@ def tool_reminder_prompt(tools: list[dict] | None = None) -> str:
     """
     names = sorted(_valid_names(tools))
     base = ("Reminder: if you need a tool, reply with ONLY "
-            '{"tool_calls": [...]} and nothing else (no Thought:, no DSML). '
+            '{"tool_calls": [...]} and nothing else (no prose before or after; '
+            "DSML / <tool_call> / fenced equivalents also accepted). "
             "If no tool is needed, answer normally.")
     if names:
         base += f" Valid names: {', '.join(names)}."
@@ -99,8 +117,10 @@ def render_prompt(messages: list[dict]) -> str:
     """Flatten OpenAI messages into the single web `prompt` string.
 
     - assistant tool_call messages become explicit "I called ..." records,
-    - tool messages become "Tool <name> returned: ..." records,
-    - same-role neighbours merge; roles map to <User>/<Assistant> markers.
+    - tool messages become "<Tool>Tool <name> returned: ..." records (kept
+      distinct from user turns so tool boundaries survive),
+    - same-role neighbours merge with a labeled separator so no boundary is
+      lost; roles map to <System>/<User>/<Assistant>/<Tool> markers.
     """
     blocks: list[tuple[str, str]] = []
     for msg in messages:
@@ -116,7 +136,7 @@ def render_prompt(messages: list[dict]) -> str:
         elif role == "tool":
             name = msg.get("name", "tool")
             text = f"Tool {name} returned: {text}"
-            role = "user"  # tool output is new information for the model
+            role = "tool"  # distinct role: tool output is new info, not a user turn
         blocks.append((role, text))
     # Accumulate chunks per role instead of concatenating the growing string
     # (O(n^2) on long same-role runs produced by tool loops).
@@ -128,10 +148,19 @@ def render_prompt(messages: list[dict]) -> str:
             merged.append((role, [text]))
     parts = []
     for idx, (role, chunks) in enumerate(merged):
-        text = "\n\n".join(chunks)
+        # Labeled separator preserves tool/message boundaries when same-role
+        # turns merge (previously plain "\n\n" lost them).
+        if len(chunks) > 1:
+            text = f"\n\n--- {role} ---\n\n".join(chunks)
+        else:
+            text = chunks[0]
         if role == "assistant":
             parts.append(f"<Assistant>{text}<endofsentence>")
-        elif role in ("user", "system"):
+        elif role == "system":
+            parts.append(f"<System>{text}")
+        elif role == "tool":
+            parts.append(f"<Tool>{text}")
+        elif role == "user":
             parts.append(text if idx == 0 else f"<User>{text}")
         else:
             parts.append(text)
@@ -164,28 +193,52 @@ def _balanced_json(text: str, start: int) -> str | None:
     return None
 
 
-def _normalize_args(args, call_idx: int) -> str:
+class _OversizeArgs(ValueError):
+    """Internal signal: arguments exceed the configured limit; caller drops."""
+
+
+def _normalize_args(args, call_idx: int, max_args_chars: int | None = None) -> str:
+    """Normalize arguments to a JSON string.
+
+    Oversize payloads are rejected (raise _OversizeArgs) instead of being
+    truncated: slicing JSON mid-object then wrapping the fragment in
+    {"_raw": ...} silently corrupts data and produces invalid arguments.
+    """
+    limit = max_args_chars if max_args_chars is not None else MAX_ARGS_CHARS
     if isinstance(args, dict):
-        return json.dumps(args, ensure_ascii=False)
+        dumped = json.dumps(args, ensure_ascii=False)
+        if len(dumped) > limit:
+            logger.warning("rejecting oversize tool arguments (%d chars > %d)", len(dumped), limit)
+            raise _OversizeArgs(f"arguments exceed {limit} chars")
+        return dumped
     if isinstance(args, str):
         candidate = args.strip()
-        if len(candidate) > MAX_ARGS_CHARS:
-            logger.warning("truncating oversized tool arguments (%d chars)", len(candidate))
-            candidate = candidate[:MAX_ARGS_CHARS]
+        if len(candidate) > limit:
+            logger.warning("rejecting oversize tool arguments (%d chars > %d)", len(candidate), limit)
+            raise _OversizeArgs(f"arguments exceed {limit} chars")
         try:
             json.loads(candidate)
         except json.JSONDecodeError:
             logger.warning("tool call %d has non-JSON arguments; wrapping", call_idx)
             return json.dumps({"_raw": candidate}, ensure_ascii=False)
         return candidate
-    return json.dumps(args, ensure_ascii=False)
+    dumped = json.dumps(args, ensure_ascii=False)
+    if len(dumped) > limit:
+        logger.warning("rejecting oversize tool arguments (%d chars > %d)", len(dumped), limit)
+        raise _OversizeArgs(f"arguments exceed {limit} chars")
+    return dumped
 
 
-def _normalize_calls(raw_calls: list, valid_names: set[str] | None) -> tuple[list[dict], list[int]]:
+def _normalize_calls(
+    raw_calls: list,
+    valid_names: set[str] | None,
+    max_args_chars: int | None = None,
+) -> tuple[list[dict], list[int]]:
     """Validate + normalize; returns (calls, dropped_indexes).
 
     Exact name match wins; case-insensitive fallback maps to the canonical
-    name so harnesses don't reject `Read` vs `read`. Unknown names dropped.
+    name so harnesses don't reject `Read` vs `read`. Unknown names and
+    oversize arguments are dropped.
     """
     lower_map: dict[str, str] = {}
     if valid_names:
@@ -213,15 +266,19 @@ def _normalize_calls(raw_calls: list, valid_names: set[str] | None) -> tuple[lis
                 dropped.append(i)
                 continue
         args = fn.get("arguments", "{}") if isinstance(fn, dict) else "{}"
+        try:
+            norm_args = _normalize_args(args, i, max_args_chars)
+        except _OversizeArgs:
+            dropped.append(i)
+            continue
         calls.append({
             "id": call.get("id", f"call_{len(calls) + 1:03d}") if isinstance(call.get("id"), str) else f"call_{len(calls) + 1:03d}",
             "type": "function",
-            "function": {"name": canonical, "arguments": _normalize_args(args, i)},
+            "function": {"name": canonical, "arguments": norm_args},
         })
     return calls, dropped
 
 
-_THOUGHT_PREFIX_RE = re.compile(r"^\s*(thought|thinking|reasoning)\s*:.{0,500}?\n", re.IGNORECASE | re.DOTALL)
 _THOUGHT_LINE_RE = re.compile(r"^\s*(thought|thinking|reasoning)\s*:.*$", re.IGNORECASE)
 
 
@@ -314,23 +371,35 @@ def _dsml_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _parse_bare_name_objects(text: str, valid: set[str] | None) -> tuple[list[dict], list[tuple[int, int]]]:
+def _parse_bare_name_objects(
+    text: str,
+    valid: set[str] | None,
+    max_objects: int | None = None,
+) -> tuple[list[dict], list[tuple[int, int]]]:
     """Unfenced {"name":..., "arguments":...} objects (parallel-safe).
 
     Generic scan, so gated by valid-names match to avoid false positives on
     normal code samples. Returns (raw_calls, spans_to_strip).
     """
+    limit = max_objects if max_objects is not None else MAX_BARE_OBJECTS
     lowers = {n.lower() for n in valid} if valid else set()
     raw: list[dict] = []
     spans: list[tuple[int, int]] = []
     count = 0
-    for m in re.finditer(r"\{", text):
-        if count >= 40:  # bound O(n^2) scan on long replies
+    pos = 0
+    n = len(text)
+    while pos < n:
+        if count >= limit:  # bound scan on long replies (tunable)
             break
-        obj_text = _balanced_json(text, m.start())
+        start = text.find("{", pos)
+        if start < 0:
+            break
+        obj_text = _balanced_json(text, start)
         if not obj_text:
+            pos = start + 1
             continue
         count += 1
+        pos = start + len(obj_text)
         try:
             obj = json.loads(obj_text)
         except json.JSONDecodeError:
@@ -353,7 +422,7 @@ def _parse_bare_name_objects(text: str, valid: set[str] | None) -> tuple[list[di
         if valid and nm not in valid and nm.lower() not in lowers:
             continue
         raw.append(candidate)
-        spans.append((m.start(), m.start() + len(obj_text)))
+        spans.append((start, start + len(obj_text)))
     return raw, spans
 
 
@@ -378,12 +447,23 @@ def _looks_like_tool_attempt(text: str, valid: set[str] | None) -> bool:
         return True
     if valid:
         for n in valid:
-            if isinstance(n, str) and n and n.lower() in low:
-                return True
+            if isinstance(n, str) and n:
+                # Word match: substring "read" must not fire on "already"/"bread".
+                if re.search(r"(?<!\w)" + re.escape(n) + r"(?!\w)", text, re.IGNORECASE):
+                    return True
     return False
 
 
-def parse_tool_calls(text: str, tools: list[dict] | None = None) -> tuple[list[dict] | None, str]:
+_FENCED_BLOCK_RE = re.compile(r"```(?:\w+)?\s*(.*?)```", re.DOTALL)
+
+
+def parse_tool_calls(
+    text: str,
+    tools: list[dict] | None = None,
+    *,
+    max_args_chars: int | None = None,
+    max_bare_objects: int | None = None,
+) -> tuple[list[dict] | None, str]:
     """Return (tool_calls or None, remaining_text).
 
     Accepted formats (first match wins):
@@ -394,56 +474,44 @@ def parse_tool_calls(text: str, tools: list[dict] | None = None) -> tuple[list[d
     5. bare unfenced {"name":..., "arguments":...} (valid-names gated).
 
     Plain answers return (None, original_text) unchanged.
+
+    Limits are tunable: `max_args_chars` defaults to MAX_ARGS_CHARS
+    (env DEEPSEAPORT_MAX_ARGS_CHARS), `max_bare_objects` defaults to
+    MAX_BARE_OBJECTS (env DEEPSEAPORT_MAX_BARE_OBJECTS).
     """
     valid = _valid_names(tools) if tools else set()
     valid_or_none = valid if tools else None
+    limit_args = max_args_chars if max_args_chars is not None else MAX_ARGS_CHARS
+    limit_bare = max_bare_objects if max_bare_objects is not None else MAX_BARE_OBJECTS
 
-    # Format 1: {"tool_calls": [...]} — balanced scan for robustness.
-    # The nearest preceding "{" position is monotonic over increasing marker
-    # positions, so cache it to avoid an O(n) rfind per marker (O(n^2) total).
-    scan_from = 0
-    for match in re.finditer(r'"tool_calls"\s*:\s*\[', text):
-        arr_start = match.group(0).rfind("[") + match.start()
-        depth = 0
-        in_str = False
-        esc = False
-        end = -1
-        for i in range(arr_start, len(text)):
-            ch = text[i]
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-            else:
-                if ch == '"':
-                    in_str = True
-                elif ch == "[":
-                    depth += 1
-                elif ch == "]":
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-        if end < 0:
-            continue
-        obj_start = text.rfind("{", scan_from, match.start())
-        if obj_start >= 0:
-            scan_from = obj_start
-        obj_text = _balanced_json(text, obj_start) if obj_start >= 0 else None
+    # Format 1: {"tool_calls": [...]} — single left-to-right balanced scan.
+    # Each balanced {...} is visited once and skipped past, so total work is
+    # linear in the reply size (no backtrack per marker).
+    pos = 0
+    n = len(text)
+    while pos < n:
+        start = text.find("{", pos)
+        if start < 0:
+            break
+        obj_text = _balanced_json(text, start)
         if not obj_text:
+            pos = start + 1
+            continue
+        if '"tool_calls"' not in obj_text:
+            pos = start + len(obj_text)
             continue
         try:
-            raw = json.loads(obj_text).get("tool_calls")
+            obj = json.loads(obj_text)
         except json.JSONDecodeError:
+            pos = start + 1
             continue
+        raw = obj.get("tool_calls") if isinstance(obj, dict) else None
         if isinstance(raw, list) and raw:
-            calls, _ = _normalize_calls(raw, valid_or_none)
+            calls, _ = _normalize_calls(raw, valid_or_none, limit_args)
             if calls:
-                rest = _clean_rest(text[:obj_start] + text[obj_start + len(obj_text):])
+                rest = _clean_rest(text[:start] + text[start + len(obj_text):])
                 return calls, rest
+        pos = start + len(obj_text)
 
     # Format 2: <tool_call>/<function_call>/<invoke> tags.
     tag_pat = re.compile(
@@ -461,7 +529,7 @@ def parse_tool_calls(text: str, tools: list[dict] | None = None) -> tuple[list[d
         elif isinstance(obj, dict) and isinstance(obj.get("function"), dict):
             tagged.append(obj)
     if tagged:
-        calls, _ = _normalize_calls(tagged, valid_or_none)
+        calls, _ = _normalize_calls(tagged, valid_or_none, limit_args)
         if calls:
             rest = _clean_rest(tag_pat.sub("", text))
             return calls, rest
@@ -470,7 +538,7 @@ def parse_tool_calls(text: str, tools: list[dict] | None = None) -> tuple[list[d
     if "dsml" in text.lower():
         dsml_raw = _parse_dsml_calls(text)
         if dsml_raw:
-            calls, dropped = _normalize_calls(dsml_raw, valid_or_none)
+            calls, dropped = _normalize_calls(dsml_raw, valid_or_none, limit_args)
             if calls:
                 # Strip on normalized text then map back by length-stable replace:
                 # fullwidth->ASCII is length-stable (1 char -> 1 char), so spans align.
@@ -482,29 +550,43 @@ def parse_tool_calls(text: str, tools: list[dict] | None = None) -> tuple[list[d
             # producing junk; log and keep scanning fenced (explicit user intent).
 
     # Format 4: fenced ```json block describing a call.
-    for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE):
-        try:
-            obj = json.loads(m.group(1))
-        except json.JSONDecodeError:
-            continue
-        raw = None
-        if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list):
-            raw = obj["tool_calls"]
-        elif isinstance(obj, dict) and obj.get("name"):
-            raw = [{"function": obj}]
-        elif isinstance(obj, dict) and isinstance(obj.get("function"), dict):
-            raw = [obj]
-        if raw:
-            calls, _ = _normalize_calls(raw, valid_or_none)
-            if calls:
-                rest = _clean_rest(text[:m.start()] + text[m.end():])
-                return calls, rest
+    # Balanced scan inside each fence so nested arguments survive
+    # (non-greedy \{.*?\} stopped at the first inner "}").
+    for m in _FENCED_BLOCK_RE.finditer(text):
+        inner = m.group(1)
+        inner_pos = 0
+        while inner_pos < len(inner):
+            obj_start = inner.find("{", inner_pos)
+            if obj_start < 0:
+                break
+            obj_text = _balanced_json(inner, obj_start)
+            if not obj_text:
+                inner_pos = obj_start + 1
+                continue
+            try:
+                obj = json.loads(obj_text)
+            except json.JSONDecodeError:
+                inner_pos = obj_start + 1
+                continue
+            raw = None
+            if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list):
+                raw = obj["tool_calls"]
+            elif isinstance(obj, dict) and obj.get("name"):
+                raw = [{"function": obj}]
+            elif isinstance(obj, dict) and isinstance(obj.get("function"), dict):
+                raw = [obj]
+            if raw:
+                calls, _ = _normalize_calls(raw, valid_or_none, limit_args)
+                if calls:
+                    rest = _clean_rest(text[:m.start()] + text[m.end():])
+                    return calls, rest
+            inner_pos = obj_start + len(obj_text)
 
     # Format 5: bare unfenced name/arguments object.
     if valid:
-        bare_raw, bare_spans = _parse_bare_name_objects(text, valid)
+        bare_raw, bare_spans = _parse_bare_name_objects(text, valid, limit_bare)
         if bare_raw:
-            calls, _ = _normalize_calls(bare_raw, valid_or_none)
+            calls, _ = _normalize_calls(bare_raw, valid_or_none, limit_args)
             if calls:
                 # Strip only the spans that survived normalization.
                 rest = _clean_rest(_strip_spans(text, bare_spans))

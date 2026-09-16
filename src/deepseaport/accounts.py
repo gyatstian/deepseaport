@@ -1,4 +1,4 @@
-"""Account pool: rotation + one in-flight stream per account + login.
+"""Account pool: rotation, cooldowns, and one in-flight stream per account.
 
 Thread-safe. Supports runtime add/remove. Cooldown accounts auto-skipped,
 acquire() fails over to next healthy account.
@@ -14,16 +14,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator
 
-from curl_cffi import requests as crequests
-
 from . import protocol as P
 from .config import AccountConfig
+from .tokens import extract_token
 
 logger = logging.getLogger("deepseaport.accounts")
 
-# Backwards-compatible alias: single source in protocol (shared with client).
-IMPERSONATE = P.IMPERSONATE
-LOGIN_TIMEOUT = 30
 COOLDOWN_SECONDS = 120
 _POLL_INTERVAL = 0.05
 # Ban check skips obviously-fake tokens (unit tests use "t1", "tok-...").
@@ -41,28 +37,10 @@ TOKEN_HELP = (
     "      JSON.parse(localStorage.getItem('userToken')).value\n"
     "    Then: python -m deepseaport accounts add --email you@x.com --token <value>\n"
     "    Paste raw value OR full JSON; both accepted. "
-    "Password-only accounts fail: direct POST login hits RISK_DEVICE_DETECTED."
+    "Password-only accounts need browser login via CLI/TUI; direct POST is "
+    "fingerprint-gated (RISK_DEVICE_DETECTED)."
 )
 
-
-def extract_token(raw: str) -> str:
-    """Accept raw 64-char value, {"value": ...} JSON, or double-encoded JSON."""
-    import json as _json
-
-    s = (raw or "").strip().strip("\"'")
-    if not s:
-        return ""
-    if s.startswith("{"):
-        try:
-            data = _json.loads(s)
-            if isinstance(data, str):  # double-encoded from browser_evaluate
-                data = _json.loads(data)
-            if isinstance(data, dict) and data.get("value"):
-                return str(data["value"]).strip()
-        except Exception:
-            pass
-    # localStorage.getItem returns JSON string; bare value passes through.
-    return s
 
 
 def _norm(identifier: str) -> str:
@@ -102,6 +80,18 @@ class PooledAccount:
     bad_until: float = 0.0
     uses: int = 0
 
+    def __post_init__(self) -> None:
+        # Carry a persisted ban into the in-memory cooldown so a restarted
+        # server does not immediately retry a known-banned account.
+        try:
+            until = float(getattr(self.cfg, "banned_until", 0.0) or 0.0)
+        except Exception:
+            until = 0.0
+        if until > time.time():
+            self.bad_until = max(self.bad_until, until)
+        elif getattr(self.cfg, "banned", False):
+            self.bad_until = max(self.bad_until, time.time() + COOLDOWN_SECONDS)
+
     @property
     def identifier(self) -> str:
         return self.cfg.identifier
@@ -111,12 +101,33 @@ class PooledAccount:
         return self.lock.locked()
 
     @property
+    def banned(self) -> bool:
+        """True while the persisted ban marker is active.
+
+        Expired known-expiry bans are cleared lazily so a restarted process
+        doesn't keep an account disabled forever after the suspension ended.
+        Unknown-expiry bans stay active until the user clears them.
+        """
+        if not getattr(self.cfg, "banned", False):
+            return False
+        try:
+            until = float(getattr(self.cfg, "banned_until", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            until = 0.0
+        if until and until <= time.time():
+            self.cfg.banned = False
+            self.cfg.banned_until = 0.0
+            self.bad_until = 0.0
+            return False
+        return True
+
+    @property
     def cooldown_remaining(self) -> float:
         return max(0.0, self.bad_until - time.time())
 
     @property
     def available(self) -> bool:
-        return not self.busy and self.cooldown_remaining <= 0
+        return not self.busy and self.cooldown_remaining <= 0 and not self.banned
 
     def status(self) -> dict:
         return {
@@ -125,6 +136,8 @@ class PooledAccount:
             "busy": self.busy,
             "cooldown_remaining": round(self.cooldown_remaining, 1),
             "uses": self.uses,
+            "banned": self.banned,
+            "banned_until": float(getattr(self.cfg, "banned_until", 0.0) or 0.0),
         }
 
 
@@ -178,7 +191,8 @@ def add_account(settings, pool: "AccountPool", cfg: AccountConfig) -> PooledAcco
 
 
 def set_account_token(settings, identifier: str, token: str) -> AccountConfig | None:
-    """Set token on the first matching settings account; return it or None."""
+    """Set normalized token on first matching settings account; return it or None."""
+    token = extract_token(token)
     for a in (getattr(settings, "accounts", None) or []):
         if _matches(a, identifier):
             a.token = token
@@ -315,16 +329,21 @@ class AccountPool:
         return rows
 
     def clear_cooldown(self, identifier: str | None = None) -> int:
-        """Clear cooldown for one account (or all when None). Returns count."""
+        """Clear cooldown/ban state for one account (or all when None)."""
         n = 0
         with self._guard:
             for item in self._items:
                 if identifier is None or _matches(item.cfg, identifier):
-                    if item.bad_until > 0:
+                    if item.bad_until > 0 or getattr(item.cfg, "banned", False):
                         n += 1
                     item.bad_until = 0.0
+                    try:
+                        item.cfg.banned = False
+                        item.cfg.banned_until = 0.0
+                    except Exception:
+                        pass
         if n:
-            logger.info("cooldown cleared for %d account(s)", n)
+            logger.info("cooldown/ban state cleared for %d account(s)", n)
         return n
 
     def acquire(self, timeout: float = 60, allow_failover: bool = True) -> PooledAccount:
@@ -359,8 +378,8 @@ class AccountPool:
                 with self._guard:
                     if item not in self._items:
                         continue  # removed concurrently
-                if item.bad_until > now:
-                    continue  # on cool -> fail over to next
+                if item.bad_until > now or item.banned:
+                    continue  # on cool/ban -> fail over to next
                 if item.lock.acquire(blocking=False):
                     with self._guard:
                         if item not in self._items:
@@ -404,8 +423,8 @@ class AccountPool:
                 with self._guard:
                     if item not in self._items:
                         continue  # removed concurrently
-                if item.bad_until > now:
-                    continue  # on cool -> fail over to next
+                if item.bad_until > now or item.banned:
+                    continue  # on cool/ban -> fail over to next
                 if item.lock.acquire(blocking=False):
                     with self._guard:
                         if item not in self._items:
@@ -441,32 +460,30 @@ class AccountPool:
         item.bad_until = time.time() + max(0.0, seconds)
         logger.warning("account %s cooling down for %ds", item.cfg.identifier, int(seconds))
 
+    @staticmethod
+    def mark_banned(item: PooledAccount, until: float | None = None,
+                    default_seconds: float = COOLDOWN_SECONDS) -> None:
+        """Mark an account banned and remember its expiry when known.
 
-def login(cfg: AccountConfig, headers: dict[str, str]) -> str:
-    """Password login (WAF cookies in headers); returns fresh user token."""
-    payload = P.login_payload(email=cfg.email, mobile=cfg.mobile, password=cfg.password)
-    resp = crequests.post(P.LOGIN_URL, headers=headers, json=payload,
-                          impersonate=IMPERSONATE, timeout=LOGIN_TIMEOUT)
-    data = _json(resp)
-    token = _dig(data, ["data", "biz_data", "user", "token"])
-    if not token:
-        raise RuntimeError(f"login failed: HTTP {resp.status_code} body={resp.text[:200]}")
-    cfg.token = token
-    logger.info("login ok for %s", cfg.identifier)
-    return token
-
-
-def _json(resp) -> dict:
-    return P.parse_json(resp)
-
-
-def _dig(data: dict, path: list[str]):
-    cur = data
-    for key in path:
-        if not isinstance(cur, dict) or key not in cur:
-            return None
-        cur = cur[key]
-    return cur
+        ``until=None`` means the page/API proved a ban but did not provide an
+        expiry; the account is still marked (CLI/TUI show ``(BANNED)``) and
+        cooled down for ``default_seconds`` so the pool skips it.
+        """
+        now = time.time()
+        try:
+            deadline = float(until) if until is not None else 0.0
+        except (TypeError, ValueError):
+            deadline = 0.0
+        if deadline > now:
+            cooldown = deadline - now
+            item.cfg.banned_until = deadline
+        else:
+            cooldown = max(0.0, float(default_seconds))
+            item.cfg.banned_until = 0.0
+        item.cfg.banned = True
+        item.bad_until = now + cooldown
+        logger.warning("account %s marked banned%s", item.cfg.identifier,
+                       f" until {int(deadline)}" if deadline > now else "")
 
 
 def check_ban_for_token(token: str, timeout: int = BAN_CHECK_TIMEOUT) -> tuple[bool, float | None]:
@@ -499,38 +516,76 @@ _BAN_CACHE: dict = {"ts": 0.0, "key": None, "result": {}}
 _BAN_REFRESH_INFLIGHT = False
 
 
+def _persisted_ban_labels(accounts: list[AccountConfig] | None) -> dict[str, float | None]:
+    """Ban labels already persisted in config, no network required."""
+    now = time.time()
+    out: dict[str, float | None] = {}
+    for a in (accounts or []):
+        if not getattr(a, "banned", False):
+            continue
+        try:
+            until = float(getattr(a, "banned_until", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            until = 0.0
+        if until and until <= now:
+            # Expired persisted ban: clear it on first access.
+            a.banned = False
+            a.banned_until = 0.0
+            continue
+        out[a.identifier] = until if until > now else None
+    return out
+
+
 def _ban_targets(accounts: list[AccountConfig] | None) -> tuple[tuple[str, str], ...]:
-    """Sorted (identifier, token) pairs worth probing; shared key/normalizer."""
+    """Sorted (identifier, token) pairs worth live-probing.
+
+    Persisted bans are skipped; their state is already known locally and the
+    CLI/TUI should show it instantly even when the account has no token.
+    """
     try:
-        targets = [((a.identifier or ""), ((a.token or "").strip()))
-                   for a in (accounts or [])]
-        targets = [(i, t) for i, t in targets if len(t) >= MIN_TOKEN_LEN_FOR_BAN_CHECK]
+        targets = []
+        for a in (accounts or []):
+            if getattr(a, "banned", False):
+                continue
+            token = (a.token or "").strip()
+            if len(token) >= MIN_TOKEN_LEN_FOR_BAN_CHECK:
+                targets.append((a.identifier or "", token))
         return tuple(sorted(targets))
     except Exception:
         return ()
 
 
 def _ban_cache_key(accounts: list[AccountConfig] | None) -> tuple:
-    return _ban_targets(accounts)
+    """Cache key covering persisted ban state + probeable tokens."""
+    try:
+        return tuple(sorted(
+            (a.identifier or "", bool(getattr(a, "banned", False)),
+             float(getattr(a, "banned_until", 0.0) or 0.0),
+             (a.token or "").strip())
+            for a in (accounts or [])
+        ))
+    except Exception:
+        return ()
 
 
 def get_cached_ban_labels(accounts: list[AccountConfig] | None) -> dict[str, float | None]:
-    """Instant, never-network ban labels (may be empty/stale). For menu render."""
+    """Instant, never-network ban labels (persisted + TTL-cached live probes)."""
     try:
+        out = _persisted_ban_labels(accounts)
         key = _ban_cache_key(accounts)
         if not key:
-            return {}
+            return out
         with _BAN_CACHE_LOCK:
-            if _BAN_CACHE.get("key") != key:
-                return {}
-            return dict(_BAN_CACHE.get("result") or {})
+            if _BAN_CACHE.get("key") == key:
+                out.update(_BAN_CACHE.get("result") or {})
+        return out
     except Exception:
         return {}
 
 
 def refresh_ban_labels_background(accounts: list[AccountConfig] | None,
                                   timeout: int = BAN_CHECK_TIMEOUT) -> None:
-    """Refresh ban-label cache in a daemon thread unless fresh/refreshing."""
+    """Refresh live ban labels in a daemon thread unless fresh/refreshing."""
     global _BAN_REFRESH_INFLIGHT
     try:
         key = _ban_cache_key(accounts)
@@ -576,19 +631,22 @@ def collect_ban_labels(accounts: list[AccountConfig],
     """
     import concurrent.futures as _fut
 
-    key = _ban_targets(accounts)
-    targets = list(key)
+    persisted = _persisted_ban_labels(accounts)
+    targets = list(_ban_targets(accounts))
+    key = _ban_cache_key(accounts)
     if not targets:
-        return {}
+        return persisted
     if not force_refresh and ttl and ttl > 0:
         try:
             with _BAN_CACHE_LOCK:
                 if (_BAN_CACHE.get("key") == key
                         and (time.time() - float(_BAN_CACHE.get("ts") or 0)) < float(ttl)):
-                    return dict(_BAN_CACHE.get("result") or {})
+                    out = dict(persisted)
+                    out.update(_BAN_CACHE.get("result") or {})
+                    return out
         except Exception:
             pass
-    out: dict[str, float | None] = {}
+    out: dict[str, float | None] = dict(persisted)
 
     def _one(pair: tuple[str, str]) -> tuple[str, bool, float | None]:
         ident, tok = pair

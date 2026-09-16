@@ -346,3 +346,42 @@ def test_main_menu_serve_still_first(monkeypatch):
     rc = main_menu(s, lambda st: calls.__setitem__("serve", 1) or 0,
                    lambda st: calls.__setitem__("chat", 1) or 0)
     assert rc == 0 and calls == {"serve": 1, "chat": 0}
+
+
+def test_settings_menu_groups_options_and_dispatches(monkeypatch, capsys):
+    from deepseaport.config import Settings
+    from deepseaport.tui import settings_menu
+
+    s = Settings(config_path="", stream_mode="live")
+    inputs = iter(["7", "q"])  # 7 = Reply streaming, q = back
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+    settings_menu(s)
+
+    out = capsys.readouterr().out
+    assert "Request handling" in out
+    assert "Chat & logs" in out
+    assert "Server access" in out
+    assert "Setup & defaults" in out
+    assert "Accounts" in out
+    assert s.stream_mode == "buffered"
+
+
+def test_main_menu_flags_incomplete_setup(monkeypatch, capsys):
+    from deepseaport.config import Settings
+    from deepseaport.tui import main_menu
+
+    s = Settings(accounts=[], active_account="", config_path="")
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "q")
+    assert main_menu(s, lambda st: 0) == 0
+    out = capsys.readouterr().out
+    assert "no accounts yet" in out
+    assert "Accounts (3)" in out
+
+
+def test_load_settings_defaults_browser_bin_to_auto(tmp_path, monkeypatch):
+    from deepseaport.config import load_settings
+
+    monkeypatch.delenv("DEEPSEAPORT_BROWSER_BIN", raising=False)
+    cfg = tmp_path / "c.json"
+    cfg.write_text("{}", encoding="utf-8")
+    assert load_settings(str(cfg)).browser_bin == "auto"

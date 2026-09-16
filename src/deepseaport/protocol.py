@@ -4,17 +4,42 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 from dataclasses import dataclass
 from typing import Iterator, Literal
 
 logger = logging.getLogger("deepseaport.protocol")
 
+# Structural split (behavior-preserving): SSE parsing lives in sse_parser.py;
+# re-exported here so `deepseaport.protocol.StreamParser` etc. keep working.
+from .sse_parser import StreamEvent, StreamParser, parse_sse_line  # noqa: F401,E402
+
+__all__ = [
+    "StreamEvent",
+    "StreamParser",
+    "parse_sse_line",
+    "parse_json",
+    "base_headers",
+    "bridge_headers",
+    "completion_payload",
+    "is_ban_payload",
+    "extract_ban_timestamp",
+    "is_ban_error_text",
+    "format_ban_day_month",
+    "format_ban_datetime",
+    "format_ban_label",
+    "ban_message",
+]
+
 # Browser fingerprint used for every curl_cffi request (shared session).
 IMPERSONATE = "chrome"
 
-HOST = "chat.deepseek.com"
-BASE = f"https://{HOST}"
-LOGIN_URL = f"{BASE}/api/v0/users/login"
+# Env override for host rotation survival (default preserves pinned host).
+# Full discovery/fallback is deferred: this knob lets ops repoint without a
+# release when chat.deepseek.com moves.
+HOST = os.environ.get("DEEPSEAPORT_HOST", "chat.deepseek.com").strip() or "chat.deepseek.com"
+BASE = os.environ.get("DEEPSEAPORT_BASE", f"https://{HOST}").strip() or f"https://{HOST}"
 USERS_CURRENT_URL = f"{BASE}/api/v0/users/current"
 SESSION_URL = f"{BASE}/api/v0/chat_session/create"
 DELETE_SESSION_URL = f"{BASE}/api/v0/chat_session/delete"
@@ -35,6 +60,23 @@ RETRYABLE_BIZ = {"POW_HEADER_ERROR", "INVALID_POW_RESPONSE", "INVALID_SESSION_ID
 # the same shape under biz_data.chat when the token is still valid.
 BANNED_BIZ_CODES = {"5", "5.0"}
 BAN_KEYWORDS = ("muted", "mute", "suspend", "banned", "violation")
+
+# Word-ish ban match: plain substring "mute" false-positives on "commute" /
+# "transmute" and would 403 + cool down a healthy account, shrinking the
+# pool. Letter boundaries (not \b: "_" must count as a boundary so
+# "is_muted"/"mute_until" still hit) keep true bans while ignoring
+# "commute". "unbanned" intentionally does NOT match (preceded by a letter).
+_BAN_RE = re.compile(
+    r"(?<![a-z])(muted?|suspend\w*|bann?ed?|violat\w*)(?![a-z])",
+    re.IGNORECASE,
+)
+
+
+def _has_ban_word(text: str) -> bool:
+    try:
+        return bool(text and _BAN_RE.search(text))
+    except Exception:
+        return False
 
 
 def _as_float(value) -> float | None:
@@ -94,10 +136,10 @@ def is_ban_payload(data: dict) -> bool:
         inner = data.get("data") if isinstance(data.get("data"), dict) else {}
         code = str(data.get("code", "") or "")
         biz_code = str((inner or {}).get("biz_code", "") or "")
-        msg = f"{data.get('msg', '')} {(inner or {}).get('biz_msg', '')}".lower()
+        msg = f"{data.get('msg', '')} {(inner or {}).get('biz_msg', '')}"
         if biz_code in BANNED_BIZ_CODES or code in BANNED_BIZ_CODES:
             return True
-        if any(k in msg for k in BAN_KEYWORDS):
+        if _has_ban_word(msg):
             return True
         biz = (inner or {}).get("biz_data")
         if isinstance(biz, dict):
@@ -112,8 +154,7 @@ def is_ban_payload(data: dict) -> bool:
 
 
 def is_ban_error_text(text: str) -> bool:
-    low = (text or "").lower()
-    return any(k in low for k in BAN_KEYWORDS)
+    return _has_ban_word(text or "")
 
 
 def _ban_dt(mute_until: float):
@@ -150,102 +191,6 @@ def ban_message(mute_until: float | None, *, prefix: str = "") -> str:
             "If you have any questions, please contact us.")
 
 
-@dataclass
-class StreamEvent:
-    kind: Literal["thinking", "content", "finished", "usage", "error"]
-    text: str = ""
-    code: str = ""
-    message: str = ""
-    # Ban expiry (mute_until unix ts) when the error carries a ban payload.
-    # Lets callers cool the account down without an extra users/current HTTP.
-    ban_until: float | None = None
-
-
-class StreamParser:
-    """Stateful SSE parser: continuation chunks arrive as bare {"v": "..."}
-    with no "p" path, so the last content path is remembered."""
-
-    CONTENT = "response/content"
-    THINKING = "response/thinking_content"
-
-    def __init__(self) -> None:
-        self.last_path = ""
-
-    def feed(self, line: str) -> Iterator[StreamEvent]:
-        line = line.strip()
-        if not line or not line.startswith("data:"):
-            return
-        data = line[5:].strip()
-        if data == "[DONE]":
-            yield StreamEvent(kind="finished")
-            return
-        try:
-            chunk = json.loads(data)
-        except json.JSONDecodeError:
-            logger.debug("skip non-JSON SSE line: %.80s", data)
-            return
-        if not isinstance(chunk, dict):
-            return
-        if "v" not in chunk:
-            # Toast errors arrive as data: {"type":"error","content":"...","finish_reason":"..."}
-            # with no "v"/"code" keys (e.g. rate_limit_reached). Surface them.
-            if chunk.get("type") == "error" or "content" in chunk and "finish_reason" in chunk:
-                code = str(chunk.get("finish_reason") or chunk.get("type") or "UPSTREAM_ERROR")
-                yield StreamEvent(kind="error", code=code,
-                                  message=str(chunk.get("content") or chunk.get("msg") or ""))
-                return
-            biz = chunk.get("data") if isinstance(chunk.get("data"), dict) else {}
-            code = chunk.get("code", (biz or {}).get("biz_code", ""))
-            # Top-level code 0 can still hide an inner ban (biz_code 5):
-            # completion ban arrives as {code:0, data:{biz_code:5,...}}.
-            inner_code = (biz or {}).get("biz_code", "")
-            if code in (0, "0", None, "") and inner_code not in (0, "0", None, ""):
-                code = inner_code
-            if code not in (0, "0", None, "") or is_ban_payload(chunk):
-                msg = str(chunk.get("msg") or (biz or {}).get("biz_msg") or "")
-                ban_ts: float | None = None
-                try:
-                    if is_ban_payload(chunk):
-                        ts = extract_ban_timestamp(chunk)
-                        ban_ts = ts
-                        if ts is not None:
-                            msg = f"{msg} (suspended until {format_ban_datetime(ts)})".strip()
-                        if not msg:
-                            msg = ban_message(ts)
-                        code = str(code) if code not in (0, "0", None, "") else "5"
-                except Exception:
-                    pass
-                yield StreamEvent(kind="error", code=str(code), message=msg,
-                                  ban_until=ban_ts)
-            return
-        path = chunk.get("p", "") or self.last_path
-        value = chunk.get("v")
-        if path == "response/status" and value == "FINISHED":
-            self.last_path = ""
-            yield StreamEvent(kind="finished")
-            return
-        if path == "response/search_status":
-            return
-        if path == "response/accumulated_token_usage" and isinstance(value, int):
-            yield StreamEvent(kind="usage", text=str(value))
-            return
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict) and item.get("p") == "status" and item.get("v") == "FINISHED":
-                    self.last_path = ""
-                    yield StreamEvent(kind="finished")
-                    return
-            return
-        if not isinstance(value, str) or not value:
-            return
-        if path == self.THINKING:
-            self.last_path = path
-            yield StreamEvent(kind="thinking", text=value)
-        elif path == self.CONTENT:
-            self.last_path = path
-            yield StreamEvent(kind="content", text=value)
-
-
 def parse_json(resp) -> dict:
     """Best-effort ``resp.json()``: {} on any error, never raises."""
     try:
@@ -254,7 +199,8 @@ def parse_json(resp) -> dict:
         return {}
 
 
-def base_headers(user_agent: str = "", waf_cookies: str = "", bearer: str = "") -> dict[str, str]:
+def _build_headers(*, user_agent: str = "", waf_cookies: str = "", bearer: str = "") -> dict[str, str]:
+    """Single header builder shared by base_headers/bridge_headers."""
     headers = {
         "Accept": "application/json, text/event-stream",
         "Accept-Language": "en-US,en;q=0.9",
@@ -268,6 +214,10 @@ def base_headers(user_agent: str = "", waf_cookies: str = "", bearer: str = "") 
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
     return headers
+
+
+def base_headers(user_agent: str = "", waf_cookies: str = "", bearer: str = "") -> dict[str, str]:
+    return _build_headers(user_agent=user_agent, waf_cookies=waf_cookies, bearer=bearer)
 
 
 def bridge_headers(bearer: str = "") -> dict[str, str]:
@@ -289,15 +239,10 @@ def bridge_headers(bearer: str = "") -> dict[str, str]:
                         waf_cookies=bridge.cookie_header(), bearer=bearer)
 
 
-def login_payload(email: str = "", mobile: str = "", password: str = "") -> dict:
-    if email:
-        return {"email": email, "password": password, "device_id": "deepseaport-web", "os": "web"}
-    return {"mobile": mobile, "area_code": None, "password": password,
-            "device_id": "deepseaport-web", "os": "web"}
-
-
 def completion_payload(session_id: str, prompt: str, thinking: bool, search: bool,
                        model_type: str = "default") -> dict:
+    # Upstream 2026-09-15 rejects source="web" with 422:
+    #   unknown variant `web`, expected `default` or `landing`.
     return {
         "chat_session_id": session_id,
         "parent_message_id": None,
@@ -306,12 +251,7 @@ def completion_payload(session_id: str, prompt: str, thinking: bool, search: boo
         "ref_file_ids": [],
         "thinking_enabled": thinking,
         "search_enabled": search,
-        "source": "web",
+        "source": "default",
         "action": None,
         "preempt": False,
     }
-
-
-def parse_sse_line(line: str) -> Iterator[StreamEvent]:
-    """Stateless one-line parse (no continuation tracking)."""
-    yield from StreamParser().feed(line)

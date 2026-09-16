@@ -13,6 +13,7 @@ dependencies = [
   "curl-cffi>=0.7",
   "wasmtime>=20",
   "pydantic>=2",
+  "websocket-client>=1.7",
 ]
 
 [project.optional-dependencies]

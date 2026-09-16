@@ -6,6 +6,7 @@ import base64
 import ctypes
 import json
 import logging
+import os
 import struct
 import threading
 from pathlib import Path
@@ -14,8 +15,14 @@ from .config import DATA_DIR
 
 logger = logging.getLogger("deepseaport.pow")
 
-WASM_NAME = "sha3_wasm_bg.7b9ca65ddd.wasm"
-WASM_URL = "https://fe-static.deepseek.com/chat/static/" + WASM_NAME
+# Env overrides for rotation survival without code change. Defaults preserve
+# current pinned behaviour; setting DEEPSEAPORT_WASM_URL lets ops point at a
+# rotated hash without waiting for a release.
+WASM_NAME = os.environ.get(
+    "DEEPSEAPORT_WASM_NAME", "sha3_wasm_bg.7b9ca65ddd.wasm")
+WASM_URL = os.environ.get(
+    "DEEPSEAPORT_WASM_URL",
+    "https://fe-static.deepseek.com/chat/static/" + WASM_NAME)
 ALGORITHM = "DeepSeekHashV1"
 # WebAssembly modules start with the magic bytes b"\0asm" (then version 1).
 _WASM_MAGIC = b"\x00asm"
@@ -88,6 +95,20 @@ def _get_engine_module():
         module = Module(engine, wasm_bytes)
         _ENGINE, _MODULE, _MODULE_KEY = engine, module, key
         return engine, module
+
+
+def prewarm() -> bool:
+    """Compile Engine/Module now so first request skips 100-300ms compile.
+
+    Best-effort: missing wasm or wasmtime errors return False, never raise.
+    Store/instance stay per-solve (Store is not thread-safe to share).
+    """
+    try:
+        _get_engine_module()
+        return True
+    except Exception as exc:
+        logger.debug("PoW prewarm skipped: %s", exc)
+        return False
 
 
 def solve(algorithm: str, challenge: str, salt: str, difficulty: int | float, expire_at: int) -> int | None:

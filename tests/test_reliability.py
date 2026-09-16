@@ -790,3 +790,112 @@ def test_session_create_40003_refreshes_token(monkeypatch, tmp_path):
     assert sessions["n"] == 2
     assert item.cfg.token == "fresh-token-1234567890"
 
+
+
+def test_auth_failover_uses_next_token_account_and_switches_current(monkeypatch):
+    """Missing/invalid-token CURRENT must fail over to a healthy account."""
+    from fastapi import HTTPException
+
+    from deepseaport.accounts import AccountPool
+    from deepseaport.server import _complete_with_failover_sync
+
+    app, settings, pool = _two_account_app()
+    used: list = []
+
+    def fake_core(app_, item_, prep_, **kw):
+        used.append(item_.cfg.email)
+        if item_.cfg.email == "a@x.com":
+            raise HTTPException(status_code=401,
+                                detail="account a@x.com has no token.")
+        return {"content": "hi from b", "thinking": "", "usage_total": 5}
+
+    monkeypatch.setattr("deepseaport.server._run_completion_core", fake_core)
+    prep = _prepare({"model": "deepseek-flash",
+                     "messages": [{"role": "user", "content": "hi"}]})
+    first = pool.acquire(timeout=1)
+    assert first.cfg.email == "a@x.com"  # CURRENT preferred first
+
+    result = _complete_with_failover_sync(app, pool, prep, first)
+
+    assert result["content"] == "hi from b"
+    assert used == ["a@x.com", "b@x.com"]
+    # The failed account is cooled down briefly so the next request skips it.
+    assert pool.get("a@x.com").cooldown_remaining > 0
+    assert not pool.get("a@x.com").lock.locked()
+    assert not pool.get("b@x.com").lock.locked()
+    assert pool.current == "b@x.com"
+    assert settings.active_account == "b@x.com"
+
+
+def test_auth_failover_all_invalid_raises_original_401(monkeypatch):
+    """When every account rejects auth, surface the original 401, not a loop."""
+    from fastapi import HTTPException
+
+    from deepseaport.accounts import AccountPool
+    from deepseaport.server import _complete_with_failover_sync
+
+    app, settings, pool = _two_account_app()
+    used: list = []
+
+    def fake_core(app_, item_, prep_, **kw):
+        used.append(item_.cfg.email)
+        raise HTTPException(status_code=401,
+                            detail=f"account {item_.cfg.email} has no token.")
+
+    monkeypatch.setattr("deepseaport.server._run_completion_core", fake_core)
+    prep = _prepare({"model": "deepseek-flash",
+                     "messages": [{"role": "user", "content": "hi"}]})
+    first = pool.acquire(timeout=1)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _complete_with_failover_sync(app, pool, prep, first)
+    assert exc_info.value.status_code == 401
+    assert used == ["a@x.com", "b@x.com"]
+
+
+def test_ban_403_persists_banned_state_for_account_list(tmp_path):
+    """Server-detected bans must survive in config for CLI/TUI labels."""
+    import time as _time
+
+    from deepseaport.config import load_settings
+    from deepseaport.server import _ban_403_for_item
+
+    path = tmp_path / "config.json"
+    settings = _settings(
+        accounts=[AccountConfig(email="banned@x.com", token="tok-banned-1234567890")],
+        active_account="banned@x.com",
+        config_path=str(path),
+    )
+    app = _app_with_bridge(settings)
+    item = PooledAccount(cfg=settings.accounts[0])
+    until = _time.time() + 86400
+
+    exc = _ban_403_for_item(app, item, until, "user is muted")
+
+    assert exc.status_code == 403
+    assert item.cfg.banned is True
+    assert item.cfg.banned_until == until
+    loaded = load_settings(str(path))
+    assert loaded.accounts[0].banned is True
+    assert loaded.accounts[0].banned_until == until
+
+
+def test_token_refresh_normalizes_json_wrapper(monkeypatch):
+    """Real-browser login returns localStorage JSON; never store it verbatim."""
+    from deepseaport.server import _refresh_token_via_obscura
+
+    settings = _settings(accounts=[AccountConfig(email="a@x.com", password="pw",
+                                                 token="stale-token-1234567890")],
+                         config_path="")
+    app = _app_with_bridge(settings)
+    item = PooledAccount(cfg=settings.accounts[0])
+    raw = '{"value":"' + ("x" * 64) + '","__version":"0"}'
+    monkeypatch.setattr("deepseaport.cli._obscura_login_token",
+                        lambda email, password, settings_: raw)
+
+    token, banned, detail = _refresh_token_via_obscura(app, item)
+
+    assert token == "x" * 64
+    assert item.cfg.token == "x" * 64
+    assert banned is False
+    assert detail == ""

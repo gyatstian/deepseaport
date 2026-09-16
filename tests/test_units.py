@@ -23,7 +23,7 @@ def test_render_prompt_roles_and_markers():
         {"role": "user", "content": "again"},
     ]
     prompt = T.render_prompt(msgs)
-    assert prompt.startswith("sys")
+    assert prompt.startswith("<System>sys")
     assert "<User>hi" in prompt
     assert "<Assistant>hello<endofsentence>" in prompt
 
@@ -279,3 +279,147 @@ def test_ban_check_skips_short_tokens_no_network():
     assert check_ban_for_token("t1") == (False, None)
     assert check_ban_for_token("") == (False, None)
     assert collect_ban_labels([AccountConfig(email="a@x.com", token="t1")]) == {}
+
+
+def test_extract_token_normalizes_json_shapes():
+    from deepseaport.tokens import extract_token
+
+    assert extract_token('{"value":null,"__version":"0"}') == ""
+    assert extract_token('{"value":"tok64","__version":"0"}') == "tok64"
+    assert extract_token('"tok64"') == "tok64"
+    double = json.dumps(json.dumps({"value": "tok99", "__version": "0"}))
+    assert extract_token(double) == "tok99"
+
+
+def test_account_config_normalizes_token_at_boundary():
+    from deepseaport.config import AccountConfig
+
+    assert AccountConfig(token='{"value":null,"__version":"0"}').token == ""
+    assert AccountConfig(token='{"value":"tok64"}').token == "tok64"
+
+
+def test_login_state_uses_visible_text_and_overlay_flag():
+    from deepseaport.auth import classify_page_state
+
+    # A healthy sign-in page with no visible challenge is not a captcha.
+    assert classify_page_state(
+        "By signing up or logging in... Forgot password? Sign up Log in", False
+    ) == ("", "")
+    # The hidden overlay phrase only counts when the overlay is actually visible.
+    assert classify_page_state("One more step before you proceed...", True)[0] == "captcha"
+    # The generic login failure is a credential/rejected state, so callers can
+    # stop polling instead of waiting the full login timeout.
+    assert classify_page_state("Log in ... Login failed.", False)[0] == "credential"
+
+
+def test_mcp_tool_iserror_becomes_exception():
+    from deepseaport.auth import _call
+
+    class _Fake:
+        def call(self, name, arguments):
+            return {"isError": True, "content": [{"type": "text", "text": "Error: nope"}]}
+
+    try:
+        _call(_Fake(), "browser_fill", {})
+    except RuntimeError as exc:
+        assert "nope" in str(exc)
+    else:
+        raise AssertionError("isError MCP result was treated as success")
+
+
+def test_parse_ban_until_from_human_login_text():
+    import time as _time
+
+    from deepseaport import protocol as P
+    from deepseaport.auth import parse_ban_until
+
+    until = parse_ban_until(
+        "Due to violation of user policies, your account has been suspended "
+        "until 16 September 2026 12:49. If you have any questions, please contact us.")
+    assert until is not None and until > _time.time()
+    assert P.format_ban_datetime(until) == "16 September 2026 12:49"
+    until_pl = parse_ban_until(
+        "Twoje konto zostało zawieszone do września 16, 2026 21:18.")
+    assert until_pl is not None
+    assert P.format_ban_datetime(until_pl) == "16 September 2026 21:18"
+
+
+def test_persisted_banned_account_label_needs_no_token():
+    import time as _time
+
+    from deepseaport.accounts import collect_ban_labels
+    from deepseaport.config import AccountConfig
+
+    until = _time.time() + 86400
+    acc = AccountConfig(email="banned@x.com", banned=True, banned_until=until)
+    labels = collect_ban_labels([acc], force_refresh=True)
+    assert labels["banned@x.com"] == until
+
+
+def test_settings_roundtrips_persisted_ban(tmp_path):
+    import time as _time
+
+    from deepseaport.config import AccountConfig, Settings, load_settings
+
+    until = _time.time() + 86400
+    path = tmp_path / "config.json"
+    settings = Settings(accounts=[AccountConfig(email="b@x.com", banned=True,
+                                                banned_until=until)],
+                        config_path=str(path))
+    settings.save()
+    loaded = load_settings(str(path))
+    assert loaded.accounts[0].banned is True
+    assert loaded.accounts[0].banned_until == until
+
+
+def test_real_browser_disabled_without_configuration(monkeypatch):
+    import deepseaport.real_browser as rb
+    from deepseaport.config import Settings
+
+    monkeypatch.setattr(rb, "resolve_browser", lambda value: "")
+    assert rb.login_with_real_browser("a@x.com", "pw", Settings(browser_bin="")) is None
+
+
+def test_settings_roundtrips_browser_fields(tmp_path):
+    from deepseaport.config import Settings, load_settings
+
+    path = tmp_path / "config.json"
+    settings = Settings(browser_bin="auto", browser_headless=True,
+                        config_path=str(path))
+    settings.save()
+    loaded = load_settings(str(path))
+    assert loaded.browser_bin == "auto"
+    assert loaded.browser_headless is True
+
+
+def test_real_browser_login_token_is_normalized(monkeypatch):
+    import deepseaport.real_browser as rb
+    from deepseaport.auth import browser_login
+    from deepseaport.config import Settings
+
+    raw = '{"value":"' + ("x" * 64) + '","__version":"0"}'
+    monkeypatch.setattr(rb, "login_with_real_browser",
+                        lambda *a, **k: (raw, False, "home page detail"))
+    result = browser_login("a@x.com", "pw", Settings(browser_bin="dummy"))
+    assert result.token == "x" * 64
+    assert result.detail == "home page detail"
+
+
+def test_set_account_token_normalizes_json_wrapper():
+    from deepseaport.accounts import set_account_token
+    from deepseaport.config import AccountConfig, Settings
+
+    settings = Settings(accounts=[AccountConfig(email="a@x.com", token="old")])
+    acc = set_account_token(settings, "a@x.com",
+                            '{"value":"fresh-token","__version":"0"}')
+    assert acc is not None and acc.token == "fresh-token"
+
+
+def test_account_config_normalizes_token_on_every_assignment():
+    from deepseaport.config import AccountConfig
+
+    acc = AccountConfig(email="a@x.com")
+    acc.token = '{"value":"runtime-token","__version":"0"}'
+    assert acc.token == "runtime-token"
+    acc.token = '{"value":null,"__version":"0"}'
+    assert acc.token == ""

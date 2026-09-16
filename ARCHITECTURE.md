@@ -11,8 +11,13 @@ harness -> FastAPI (/v1/*, OpenAI-compatible) -> curl_cffi (Chrome TLS) -> chat.
 Obscura (h4ckf0r0day/obscura, headless browser) ________|
   - owns persistent profile (~/.deepseaport/obscura-profile)
   - solves AWS WAF JS challenge, holds `aws-waf-token` cookie
-  - performs login (real device fingerprint)
-  - MCP stdio used for interactive login only
+  - used only for WAF/hot-path; not for login
+
+real Helium/Chrome/Edge/Chromium (CDP) _______________|
+  - optional but preferred for auto-token/login
+  - owns a temporary profile
+  - runs Shumei `fp.min.js`, supplies `device_id`, captures userToken
+  - controlled by `real_browser.py`; selector-driven, not ref-driven
 ```
 
 Hot path is **direct HTTP, never DOM driving**. Obscura is re-invoked only
@@ -27,7 +32,8 @@ needed. Local binaries are gitignored, never committed.
 
 1. Acquire account (one in-flight stream per account — DeepSeek limitation,
    enforced by per-account `threading.Lock` + rotation + 120 s cooldown).
-2. Token: pasted `userToken` from login, else password login (see Auth).
+2. Token: account `token`, else a fast 401 that the failover helper can
+   route to another token-backed account (see Auth).
 3. `POST /api/v0/chat_session/create` `{"agent":"chat"}` → session id.
    Response shapes vary; parse `data.biz_data.id` or `data.biz_data.chat_session.id`.
 4. `POST /api/v0/chat/create_pow_challenge` `{"target_path":"/api/v0/chat/completion"}`.
@@ -66,13 +72,35 @@ bad (cooldown) on ban/restricted/401.
   Direct login is fingerprinted (fp-1.min.js, fengkongcloud deviceprofile, `did`).
 - Old mobile path (`DeepSeek/1.0.13 Android/35`, `x-client-version 1.3.0-auto-resume`)
   → `CLIENT_VERSION_TOO_LOW`. Do not chase client versions.
-- Working path: Obscura MCP (`mcp_client.py`, stdlib JSON-RPC over stdio):
-  `browser_navigate .../sign_in` → `browser_interactive_elements` (refs are
-  **per-connection** — snapshot + fill + click must share one `McpClient`) →
-  fill `e1`/`e2`, click `e8` (Log in) → poll `localStorage.getItem('userToken')`.
-  No turnstile appeared during testing, but if login ever yields no token,
-  assume captcha and fall back to manual token paste.
+- Preferred working path: a real Chromium-family browser via CDP
+  (`real_browser.py`) when `browser_bin` is `"auto"` or a path. It opens the
+  sign-in page, dismisses the cookie banner, fills email/password, clicks the
+  login button, waits for Shumei to initialize, and polls
+  `localStorage.userToken`. This is what runs on user machines with Helium.
+- Obscura MCP (`mcp_client.py`, stdlib JSON-RPC over stdio) remains a fallback
+  (`auth.py`): `browser_navigate .../sign_in` (`networkidle0`) → dismiss the
+  cookie banner → fill stable selectors → wait for React state → click the
+  real "Log in" `role=button` → poll `localStorage.userToken`. It cannot
+  initialize Shumei (`device_id: null`), so it is only a fallback.
+- Do not use ``browser_fill_form`` with a `submit_selector`: it clicks before
+  React commits, so the form can post empty credentials or show a generic
+  "Login failed" without a network request. Two-stage fill + click is reliable.
+- Refs (`e1`, `e2`, `e8`, ...) are scoped to one MCP connection and renumber
+  whenever the SPA changes, so `auth.py` does not use them. Hardcoded refs were
+  the cause of clicking cookie/social UI and triggering apparently random
+  challenges.
+- Captcha detection uses only *visible* text plus an explicit visibility check
+  on `#cf-overlay`. The sign-in SPA always ships that overlay with
+  `display:none` and the literal words "One more step before you proceed...",
+  so scanning raw `document.body.innerText` classified every successful login
+  as a captcha.
+- Missing-token accounts are not browser-logged-in on the first API request;
+  they surface a fast 401 and `_complete_with_failover_sync` can move to the
+  next account that already has a token. Expired tokens still get one Obscura
+  refresh attempt, with login backoff after captcha/credential failure.
 - Old/stale tokens fail with `40003 Authorization Failed` at session create.
+- `POST /v1/accounts/unblock` (and `deepseaport accounts unblock [identifier]`)
+  clears the in-memory cooldown and the persisted ban marker.
 
 ## PoW details
 
@@ -148,12 +176,20 @@ variants under old names, `deepseek-vision`.
 
 ## Environment / files
 
-- `config.json` (gitignored): `{keys, accounts[{email,mobile,password,token}], active_account, obscura_bin, obscura_profile, port, listen, enable_tools, warmup_on_startup, auto_delete_session, max_retries, parallel_challenge_fetch, use_multiple_accounts, log_level, stream_mode, chat_model}`.
+- `config.json` (gitignored): `{keys, accounts[{email,mobile,password,token,banned,banned_until}], active_account, obscura_bin, obscura_profile, browser_bin, browser_headless, port, listen, enable_tools, warmup_on_startup, auto_delete_session, max_retries, parallel_challenge_fetch, use_multiple_accounts, log_level, stream_mode, chat_model}`.
+  `AccountConfig.__post_init__` normalizes pasted token JSON (including
+  `{"value":null}`) through `tokens.py`, so broken shapes become an empty token
+  instead of a mysterious 40003 later. Bans found by the server/login page are
+  persisted as `banned`/`banned_until`, so CLI/TUI show `(BANNED: 16 September)`
+  even after a restart and even when the account token is missing/cleared.
   `use_multiple_accounts` (default true): busy/cooldown CURRENT fails over to
   another healthy account (parallel subagents); false pins requests to CURRENT.
   `listen: true` binds `0.0.0.0` (LAN); default false binds `127.0.0.1`; `--host` overrides.
 - `data/` (gitignored): PoW wasm. `~/.deepseaport/obscura-profile`: WAF cookies + login localStorage.
-- `src/deepseaport/mcp_client.py` is used by `deepseaport login` only, not the hot path.
+- `src/deepseaport/real_browser.py` drives Helium/Chrome/Edge/Chromium login
+  over CDP; `browser_paths.py` discovers the binary. `auth.py` chooses real
+  browser first and falls back to Obscura; `mcp_client.py` is the Obscura
+  stdio transport. None of these are on the HTTP hot path.
 - `GET /v1/waf/status` shows binary/profile/WAF-cookie state for debugging.
 - Live verification scripts used during development live in the temp dir, not
   the repo: `verify_live2.py` (session→PoW→completion), `verify_tools.py`

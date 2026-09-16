@@ -11,7 +11,7 @@
 - tool calling seems ok. most often fails on long/complicated ones so advise him to implement one by one and it will be ok<br>
 - app needs https://aka.ms/vs/17/release/vc_redist.x64.exe beacuse of obscura
 
-# deepseaport — DeepSeek web2api (Obscura-backed)
+# deepseaport — DeepSeek web2api (Obscura WAF + real-browser login)
 
 Unofficial, research-only bridge: exposes `chat.deepseek.com` web chat as an
 OpenAI-compatible API (`/v1/chat/completions`, streaming + `tools`).
@@ -22,6 +22,10 @@ How it works:
   profile that solves the AWS WAF JavaScript challenge and holds the
   `aws-waf-token` cookie. All DeepSeek HTTP calls replay that cookie jar,
   with a browser User-Agent captured from the same engine.
+- **Auto-token/login** uses a real installed Helium/Chrome/Edge/Chromium via
+  CDP (`browser_bin: "auto"`), because DeepSeek's Shumei device-id SDK does
+  not initialize in the Obscura no-render engine. Obscura remains the WAF and
+  hot-path engine.
 - Hot path is direct HTTP (`curl_cffi`, Chrome TLS impersonation):
   login → create session → PoW challenge (`DeepSeekHashV1` wasm) →
   `POST /api/v0/chat/completion` (SSE `p`/`v` events) → delete session.
@@ -48,7 +52,7 @@ Obscura binary (`h4ckf0r0day/obscura`, i personally use no-render stealth): drop
 **B. python:**
 ```powershell
 pip install -e .
-python -m deepseaport login --email you@x.com  # browser login via Obscura, saves token
+python -m deepseaport login --email you@x.com  # real Helium/Chrome login, saves token
 python -m deepseaport waf                      # verify Obscura + WAF cookie
 python -m deepseaport serve                    # :5001
 ```
@@ -82,6 +86,8 @@ curl -N http://127.0.0.1:5001/v1/chat/completions `
   "active_account": "",
   "obscura_bin": "",
   "obscura_profile": "",
+  "browser_bin": "auto",
+  "browser_headless": false,
   "port": 5001,
   "listen": false,
   "chat_model": "deepseek-flash"
@@ -98,16 +104,31 @@ TUI Settings screen.
 
 `use_multiple_accounts` (default `true`, env:
 `DEEPSEAPORT_USE_MULTIPLE_ACCOUNTS`): when `true` and `CURRENT` is busy
-(one in-flight stream per account, enforced by per-account lock) or cooling
-down (banned), the request fails over to another healthy account — this is
-what lets parallel subagents / multitasking share one instance. When
-`false`, requests stick to `CURRENT` and queue on it instead.
+(one in-flight stream per account, enforced by per-account lock), cooling
+down (banned), or auth-broken (missing/invalid token), the request fails over
+to another healthy account — this is what lets parallel subagents /
+multitasking share one instance. When `false`, requests stick to `CURRENT`
+and queue on it instead.
 
 `"listen": true` serves on `0.0.0.0` (LAN-visible); default `false` binds
 `127.0.0.1` only. `--host` flag overrides both.
 
 You can skip email/password by pasting a `userToken` from a logged-in
-browser (localStorage) into `accounts[].token`.
+browser (localStorage) into `accounts[].token`. Raw values and the full
+`{"value":"...","__version":"0"}` JSON are both accepted; a `{"value":null}`
+shape is normalized to "missing token" instead of causing a later 40003.
+
+When `use_multiple_accounts` is true, an account with a missing/invalid token
+is cooled down briefly and the request fails over to the next account that
+already has a working token. Use `deepseaport login` (or the TUI auto-token
+flow) to provision password-only accounts; the server does not spawn a login
+browser on the request hot path.
+
+Bans detected by the server or login page are persisted in `accounts[].banned`
+and `accounts[].banned_until`, so the accounts screen keeps showing
+`(BANNED: 16 September)` after restarts and even when the account has no token.
+Clear that state with `POST /v1/accounts/unblock` or
+`python -m deepseaport accounts unblock [identifier]`.
 
 ## Endpoints
 

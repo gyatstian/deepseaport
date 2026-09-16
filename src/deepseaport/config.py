@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .tokens import extract_token
+
+logger = logging.getLogger("deepseaport.config")
 
 DEFAULT_PORT = 5001
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -16,6 +22,11 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 # Serializes config.json writes within the process. Callers span the event
 # loop (endpoint saves) and worker threads (_ensure_token / account pool);
 # without this a concurrent Path.write_text can truncate/interleave the file.
+# NOTE: process-local only. Separate OS processes (uvicorn --workers N) each
+# have their own lock; atomic os.replace keeps the file valid JSON but the
+# last writer wins (a ban/token saved in one worker can be overwritten by a
+# concurrent save from another). No file lock: it would add a Windows
+# dependency + stale-lock risk without fixing last-writer-wins.
 _CONFIG_SAVE_LOCK = threading.Lock()
 
 
@@ -36,6 +47,31 @@ class AccountConfig:
     mobile: str = ""
     password: str = ""
     token: str = ""
+    # Persisted ban marker so CLI/TUI labels survive process restarts and
+    # accounts whose token is missing. ``banned_until`` is 0 when unknown.
+    banned: bool = False
+    banned_until: float = 0.0
+
+    def __setattr__(self, name, value):
+        # Normalize at every assignment, not just construction. Runtime token
+        # refresh, TUI set-token, and API endpoints all mutate this field and
+        # must never leak the full JSON wrapper into an Authorization header.
+        if name == "token":
+            value = extract_token(value)
+        super().__setattr__(name, value)
+
+    def __post_init__(self) -> None:
+        # Normalize pasted JSON shapes (including {"value":null}) at the
+        # boundary so the rest of the app only ever sees a raw token or "".
+        self.token = extract_token(self.token)
+        try:
+            self.banned_until = max(0.0, float(self.banned_until or 0.0))
+        except (TypeError, ValueError):
+            self.banned_until = 0.0
+        # Expired persisted bans shouldn't hide a usable account forever.
+        if self.banned and self.banned_until and self.banned_until <= time.time():
+            self.banned = False
+            self.banned_until = 0.0
 
     @property
     def identifier(self) -> str:
@@ -53,6 +89,12 @@ class Settings:
     active_account: str = ""
     obscura_bin: str = ""
     obscura_profile: str = ""
+    # Real-browser login: "" disables it; load_settings() defaults a fresh
+    # config to "auto" so Chrome/Helium discovery works out of the box.
+    # The browser is used only for interactive login/token refresh, never the
+    # hot path; Obscura still owns WAF cookies.
+    browser_bin: str = ""
+    browser_headless: bool = False
     port: int = DEFAULT_PORT
     # true -> bind 0.0.0.0 (all interfaces); false -> 127.0.0.1 only.
     # --host CLI flag overrides both.
@@ -79,12 +121,17 @@ class Settings:
         payload = {
             "keys": self.keys,
             "accounts": [
-                {"email": a.email, "mobile": a.mobile, "password": a.password, "token": a.token}
+                {"email": a.email, "mobile": a.mobile, "password": a.password,
+                 "token": extract_token(a.token),
+                 "banned": bool(getattr(a, "banned", False)),
+                 "banned_until": float(getattr(a, "banned_until", 0.0) or 0.0)}
                 for a in self.accounts
             ],
             "active_account": self.active_account,
             "obscura_bin": self.obscura_bin,
             "obscura_profile": self.obscura_profile,
+            "browser_bin": self.browser_bin,
+            "browser_headless": self.browser_headless,
             "port": self.port,
             "listen": self.listen,
             "enable_tools": self.enable_tools,
@@ -112,16 +159,42 @@ class Settings:
                     fh.write(data)
                     fh.flush()
                     os.fsync(fh.fileno())
-                try:
-                    os.replace(tmp_name, target)
-                    tmp_name = None
-                except PermissionError:
+                # Transient AV/indexer locks block rename for ~ms: retry so the
+                # atomic path still wins instead of degrading to in-place.
+                replaced = False
+                last_err: OSError | None = None
+                for attempt in range(4):
+                    try:
+                        os.replace(tmp_name, target)
+                        tmp_name = None
+                        replaced = True
+                        break
+                    except PermissionError as exc:
+                        last_err = exc
+                        time.sleep(0.05 * (attempt + 1))
+                    except OSError as exc:
+                        last_err = exc
+                        break
+                if not replaced:
                     # Windows: an external handle (editor, antivirus, another
                     # process) can block the rename even though in-place writes
                     # are allowed, because rename needs FILE_SHARE_DELETE on
-                    # every open handle. Fall back to a direct overwrite; the
-                    # save lock still serializes our own writers.
-                    target.write_text(data, encoding="utf-8")
+                    # every open handle. Fall back to a direct overwrite (with
+                    # fsync to shrink the crash half-write window); the save
+                    # lock still serializes our own writers. Loud warning: the
+                    # non-atomic path risks a truncated config on crash, but
+                    # raising here would 500 endpoints whose in-memory state
+                    # already succeeded.
+                    logger.warning(
+                        "config replace blocked (%s), overwriting in place: %s",
+                        last_err, target)
+                    with open(target, "w", encoding="utf-8") as fh:
+                        fh.write(data)
+                        fh.flush()
+                        try:
+                            os.fsync(fh.fileno())
+                        except OSError:
+                            pass
             finally:
                 if tmp_name:
                     try:
@@ -131,6 +204,11 @@ class Settings:
 
 
 def _default_config_path() -> Path:
+    # Resolution order is intentional: explicit DEEPSEAPORT_CONFIG env wins,
+    # then a config.json in the current working directory (per-deployment
+    # override), then the app/exe directory. Keeping cwd support (not a single
+    # path) preserves portable multi-instance setups; callers log the chosen
+    # file so a different-cwd silent 401/503 is diagnosable.
     env = os.environ.get("DEEPSEAPORT_CONFIG")
     if env:
         return Path(env)
@@ -142,6 +220,10 @@ def _default_config_path() -> Path:
 
 def load_settings(path: str | None = None) -> Settings:
     cfg_path = Path(path) if path else _default_config_path()
+    try:
+        logger.info("using config: %s (cwd=%s)", cfg_path, Path.cwd())
+    except Exception:
+        pass
     raw: dict = {}
     if cfg_path.exists():
         try:
@@ -159,8 +241,11 @@ def load_settings(path: str | None = None) -> Settings:
             accounts.append(AccountConfig(
                 email=a.get("email", ""), mobile=a.get("mobile", ""),
                 password=a.get("password", ""), token=a.get("token", ""),
+                banned=bool(a.get("banned", False)),
+                banned_until=a.get("banned_until", 0.0),
             ))
-    # Single-account env override (takes precedence if config has only a placeholder).
+    # Single-account env: replaces placeholder config, otherwise appends as an
+    # extra failover account (DEEPSEAPORT_KEYS replaces keys; TOKEN appends).
     env_token = os.environ.get("DEEPSEAPORT_TOKEN") or os.environ.get("DEEPSEEK_TOKEN")
     env_email = os.environ.get("DEEPSEAPORT_EMAIL") or os.environ.get("DEEPSEEK_EMAIL")
     env_password = os.environ.get("DEEPSEAPORT_PASSWORD") or os.environ.get("DEEPSEEK_PASSWORD")
@@ -210,6 +295,9 @@ def load_settings(path: str | None = None) -> Settings:
                                            raw.get("active_account", ""))).strip(),
         obscura_bin=os.environ.get("OBSCURA_BIN", raw.get("obscura_bin", "")),
         obscura_profile=os.environ.get("OBSCURA_PROFILE", raw.get("obscura_profile", "")),
+        browser_bin=os.environ.get(
+            "DEEPSEAPORT_BROWSER_BIN", raw.get("browser_bin", "auto")),
+        browser_headless=_bool("DEEPSEAPORT_BROWSER_HEADLESS", "browser_headless", False),
         port=port,
         listen=_bool("DEEPSEAPORT_LISTEN", "listen", False),
         config_path=str(cfg_path),

@@ -33,7 +33,7 @@ WARMUP_SKIP_SECONDS = 60.0
 
 logger = logging.getLogger("deepseaport.obscura")
 
-CHAT_HOME = "https://chat.deepseek.com/"
+CHAT_HOME = os.environ.get("DEEPSEAPORT_CHAT_HOME", "https://chat.deepseek.com/").strip() or "https://chat.deepseek.com/"
 
 
 def _repo_root() -> Path:

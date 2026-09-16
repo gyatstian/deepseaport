@@ -18,9 +18,6 @@ def _on_off(value: bool) -> str:
     return "ON" if value else "OFF"
 
 
-_DIV = "-" * 44
-
-
 def _use_color() -> bool:
     """False when NO_COLOR is set or stdout is not a tty (logs/tests stay clean)."""
     if os.environ.get("NO_COLOR") is not None:
@@ -69,8 +66,16 @@ def _header(title: str) -> None:
     print()
 
 
-def _divider() -> None:
-    print(_c(f"  {_DIV}", "2"))
+def _section(title: str) -> None:
+    """Group related settings without adding a nested menu."""
+    print()
+    print(_c(f"  {title}", "1"))
+
+
+def _setting_line(number: int, label: str, value: str,
+                  width: int = 28) -> None:
+    """One settings row: number, label, current value."""
+    print(f"  {number:>2}. {label:<{width}} {value}")
 
 
 def _ok(msg: str) -> None:
@@ -133,7 +138,7 @@ def _toggle_stream(settings: Settings) -> None:
     """Instant buffered<->live flip, saved immediately."""
     settings.stream_mode = "live" if settings.stream_mode != "live" else "buffered"
     settings.save()
-    _ok(f"Stream mode -> {settings.stream_mode} (saved)")
+    _ok(f"Reply streaming -> {settings.stream_mode} (saved)")
 
 
 def _edit_choice(settings: Settings, attr: str, label: str, options: tuple[str, ...]) -> None:
@@ -144,7 +149,7 @@ def _edit_choice(settings: Settings, attr: str, label: str, options: tuple[str, 
         mark = " *" if opt == current else ""
         print(f"    {i}. {opt}{mark}")
     print()
-    ans = _ask("Pick number (Enter=cancel)", default="")
+    ans = _ask("Number or value (Enter=cancel)", default="")
     if not ans:
         _info("Cancelled.")
         return
@@ -170,8 +175,8 @@ def _edit_choice(settings: Settings, attr: str, label: str, options: tuple[str, 
 
 def _edit_retries(settings: Settings) -> None:
     print()
-    _info(f"Retry count per failure class (pow/session/WAF), current: {settings.max_retries}.")
-    _info("0 disables retries; 1 matches the original one-retry behaviour.")
+    _info(f"Retries per failed request (current: {settings.max_retries}).")
+    _info("0 disables retries; the original default is 1.")
     print()
     ans = _ask("Enter 0-5 (Enter=cancel)", default="")
     if not ans:
@@ -360,59 +365,46 @@ def _edit_chat_model(settings: Settings) -> None:
 def settings_menu(settings: Settings) -> None:
     """Blocking settings editor; returns on Back.
 
-    Two-state settings (bools + buffered/live stream) flip instantly on
-    number press. Multi-value settings (retry count, log level, port, keys,
-    obscura path, chat model) prompt.
+    Settings are grouped by purpose instead of shown as one flat list. The
+    numbering is kept stable so existing users do not lose muscle memory;
+    toggles save immediately and multi-value options prompt for a new value.
     """
-    descriptions = {
-        1: "Tool calling on/off",
-        2: "WAF warmup at startup",
-        3: "Auto-delete session after use",
-        4: "Retries per failure class (0 disables)",
-        5: "Fetch session + challenge in parallel",
-        6: "Log level for deepseaport loggers",
-        7: "buffered (one reply) vs live (token deltas)",
-        8: "Serve on 0.0.0.0 (LAN) vs 127.0.0.1 (localhost only)",
-        9: "TCP port (free-check, auto-fix when busy)",
-        10: "API keys (masked, empty = no Bearer needed)",
-        11: "Obscura binary path (empty = auto-discover)",
-        12: "Chat model remembered for server-with-chat",
-        13: "Busy CURRENT uses another healthy account (parallel subagents)",
-    }
     _clear_screen()
     while True:
         _header(f"Settings ({settings.config_path or 'unsaved'})")
-        print(f"  1. Tool calling .......... {_on_off(settings.enable_tools)}")
-        _info(f"     {descriptions[1]}")
-        print(f"  2. Startup WAF warmup .... {_on_off(settings.warmup_on_startup)}")
-        _info(f"     {descriptions[2]}")
-        print(f"  3. Auto session delete ... {_on_off(settings.auto_delete_session)}")
-        _info(f"     {descriptions[3]}")
-        print(f"  4. Retry count ........... {settings.max_retries}")
-        _info(f"     {descriptions[4]}")
-        print(f"  5. Parallel fetch ........ {_on_off(settings.parallel_challenge_fetch)}")
-        _info(f"     {descriptions[5]}")
-        print(f"  6. Log level ............. {settings.log_level}")
-        _info(f"     {descriptions[6]}")
-        print(f"  7. Stream mode ........... {settings.stream_mode}")
-        _info(f"     {descriptions[7]}")
-        print(f"  8. Listen all interfaces . {_on_off(settings.listen)}")
-        _info(f"     {descriptions[8]}")
-        obsc = (getattr(settings, "obscura_bin", "") or "").strip() or "(auto)"
-        if len(obsc) > 28:
-            obsc = "..." + obsc[-25:]
+
+        _section("Request handling")
+        _setting_line(1, "Tool calling", _on_off(settings.enable_tools))
+        _setting_line(2, "Warm up WAF at startup",
+                      _on_off(settings.warmup_on_startup))
+        _setting_line(3, "Delete session after reply",
+                      _on_off(settings.auto_delete_session))
+        _setting_line(4, "Retries per failed request", str(settings.max_retries))
+        _setting_line(5, "Parallel setup requests",
+                      _on_off(settings.parallel_challenge_fetch))
+
+        _section("Chat & logs")
+        _setting_line(6, "Log level", str(settings.log_level))
+        _setting_line(7, "Reply streaming", str(settings.stream_mode))
+
+        _section("Server access")
+        _setting_line(8, "Allow LAN access", _on_off(settings.listen))
+        _setting_line(9, "Port", str(settings.port))
         nkeys = len(getattr(settings, "keys", []) or [])
         keys_disp = f"{nkeys} set" if nkeys else "none (open)"
-        print(f"  9. Port .................. {settings.port}")
-        _info(f"     {descriptions[9]}")
-        print(f"  10. API keys .............. {keys_disp}")
-        _info(f"     {descriptions[10]}")
-        print(f"  11. Obscura binary ........ {obsc}")
-        _info(f"     {descriptions[11]}")
-        print(f"  12. Chat model ............ {settings.chat_model}")
-        _info(f"     {descriptions[12]}")
-        print(f"  13. Use multiple accounts  {_on_off(getattr(settings, 'use_multiple_accounts', True))}")
-        _info(f"     {descriptions[13]}")
+        _setting_line(10, "API keys", keys_disp)
+
+        _section("Setup & defaults")
+        obsc = (getattr(settings, "obscura_bin", "") or "").strip() or "(auto)"
+        if len(obsc) > 30:
+            obsc = "..." + obsc[-27:]
+        _setting_line(11, "Obscura binary", obsc)
+        _setting_line(12, "Chat model", str(settings.chat_model))
+
+        _section("Accounts")
+        _setting_line(13, "Account failover",
+                      _on_off(getattr(settings, "use_multiple_accounts", True)))
+
         print()
         print("  14. Back (q)")
         print()
@@ -426,25 +418,29 @@ def settings_menu(settings: Settings) -> None:
         if choice not in {str(i) for i in range(1, 14)}:
             _err("Unknown option: type 1-13, or q.")
             continue
-        print()
-        _divider()
+        # Clear the menu before prompting so repeated edits do not stack
+        # multiple copies of the settings screen in the terminal.
+        _clear_screen()
         try:
             if choice == "1":
                 _toggle_bool(settings, "enable_tools", "Tool calling")
             elif choice == "2":
-                _toggle_bool(settings, "warmup_on_startup", "Startup WAF warmup")
+                _toggle_bool(settings, "warmup_on_startup",
+                             "WAF warmup at startup")
             elif choice == "3":
-                _toggle_bool(settings, "auto_delete_session", "Auto session delete")
+                _toggle_bool(settings, "auto_delete_session",
+                             "Delete session after reply")
             elif choice == "4":
                 _edit_retries(settings)
             elif choice == "5":
-                _toggle_bool(settings, "parallel_challenge_fetch", "Parallel challenge fetch")
+                _toggle_bool(settings, "parallel_challenge_fetch",
+                             "Parallel setup requests")
             elif choice == "6":
                 _edit_choice(settings, "log_level", "Log level", VALID_LOG_LEVELS)
             elif choice == "7":
                 _toggle_stream(settings)
             elif choice == "8":
-                _toggle_bool(settings, "listen", "Listen all interfaces (0.0.0.0)")
+                _toggle_bool(settings, "listen", "Allow LAN access")
             elif choice == "9":
                 _edit_port(settings)
             elif choice == "10":
@@ -455,7 +451,7 @@ def settings_menu(settings: Settings) -> None:
                 _edit_chat_model(settings)
             elif choice == "13":
                 _toggle_bool(settings, "use_multiple_accounts",
-                             "Use multiple accounts on one instance")
+                             "Account failover")
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -503,14 +499,37 @@ def accounts_menu(settings: Settings) -> None:
             print()
             print(TOKEN_HELP)
             return ""
-        from .cli import _obscura_login_token
+        from .cli import _obscura_login_token, _unpack_login_token_result
         _info("Running Obscura login (browser, ~30s)...")
         try:
-            token = _obscura_login_token(email, password, settings)
+            token, login_banned, ban_detail = _unpack_login_token_result(
+                _obscura_login_token(email, password, settings))
         except Exception as exc:
             _err(f"Auto-login failed: {exc}")
             print()
             print(TOKEN_HELP)
+            return ""
+        if login_banned:
+            if token:
+                try:
+                    from .auth import parse_ban_until
+                    from .accounts import _matches as _m
+                    until = parse_ban_until(ban_detail)
+                    for a in settings.accounts:
+                        if _m(a, email):
+                            a.banned = True
+                            a.banned_until = float(until or 0.0)
+                except Exception:
+                    pass
+                _err(f"Auto-login captured a token for {email}, "
+                     "but the account is BANNED. Token saved; Account "
+                     "list will show the ban.")
+                if ban_detail:
+                    print(f"Evidence: {ban_detail[:300]}")
+                return token
+            _err(f"Auto-login refused for {email}: account BANNED per login page.")
+            if ban_detail:
+                print(f"Evidence: {ban_detail[:300]}")
             return ""
         if not token:
             return ""
@@ -593,15 +612,18 @@ def accounts_menu(settings: Settings) -> None:
         if choice in ("b", "back", "q", "quit", ""):
             return
         if choice == "h":
+            _clear_screen()
             print()
             print(TOKEN_HELP)
             continue
         if choice == "c":
+            _clear_screen()
             settings.active_account = ""
             settings.save()
             _ok("Selection cleared -> ALL (auto-failover)")
             continue
         if choice == "a":
+            _clear_screen()
             print()
             try:
                 email = _ask("Email (Enter=skip)", default="")
@@ -629,6 +651,7 @@ def accounts_menu(settings: Settings) -> None:
                 print(TOKEN_HELP)
             continue
         if choice == "t":
+            _clear_screen()
             print()
             try:
                 ident = _ask("Account email", default="")
@@ -658,6 +681,7 @@ def accounts_menu(settings: Settings) -> None:
                 _err(f"Not found: {ident}")
             continue
         if choice == "d":
+            _clear_screen()
             print()
             try:
                 ident = _ask("Identifier to DELETE (email or number)", default="")
@@ -698,6 +722,7 @@ def accounts_menu(settings: Settings) -> None:
         except ValueError:
             _err("Unknown option. Number selects, d deletes.")
             continue
+        _clear_screen()
         rows_now = pool.status()
         if 0 <= idx < len(rows_now):
             ident = rows_now[idx]["identifier"]
@@ -715,8 +740,8 @@ def _preflight_reason(settings: Settings) -> str:
     """Block Start when serving would fail fast. "" means ready.
 
     Empty pool -> 503 on first request; accounts without any token ->
-    401 on first request (password-only fails). Caller jumps to the
-    Accounts menu so the fix is one step away.
+    401/failover on first request. Caller jumps to the Accounts menu so
+    the fix is one step away.
     """
     if not settings.accounts:
         return "No accounts yet. Add one first."
@@ -743,15 +768,22 @@ def main_menu(settings: Settings, serve_fn: Callable[[Settings], int],
               multi_fn: Callable[[Settings], int] | None = None) -> int:
     """Blocking main page. Server stop returns to menu (0 = quit)."""
     _clear_screen()
+    accounts_num = "5" if chat_fn is not None else "3"
     while True:
         _header("deepseaport")
         _info(f"Config   : {settings.config_path or '(unsaved)'}")
-        _info(f"Host     : {'0.0.0.0 (all interfaces)' if settings.listen else '127.0.0.1 (localhost)'}")
+        _info(f"Host     : {'0.0.0.0 (all interfaces)' if settings.listen else '127.0.0.1 (localhost only)'}")
         _info(f"Port     : {settings.port}")
-        _info(f"Stream   : {settings.stream_mode}  |  Tools: {_on_off(settings.enable_tools)}"
-              f"  |  Multi: {_on_off(getattr(settings, 'use_multiple_accounts', True))}")
+        _info(f"Reply    : {settings.stream_mode}  |  Tools: {_on_off(settings.enable_tools)}"
+              f"  |  Failover: {_on_off(getattr(settings, 'use_multiple_accounts', True))}")
         cur = (settings.active_account or "").strip() or "ALL"
         _info(f"Accounts : {len(settings.accounts)}  |  Current: [{cur}]")
+        has_token = any((getattr(a, "token", "") or "").strip()
+                        for a in settings.accounts)
+        if not settings.accounts:
+            _info(f"Setup    : no accounts yet -> Accounts ({accounts_num}) to add one")
+        elif not has_token:
+            _info(f"Setup    : no account token -> Accounts ({accounts_num}) to refresh one")
         print()
         print("  1. Start server")
         if chat_fn is not None:
@@ -832,9 +864,11 @@ def main_menu(settings: Settings, serve_fn: Callable[[Settings], int],
             continue
         if choice == ("4" if chat_fn is not None else "2"):
             settings_menu(settings)
+            _clear_screen()
             continue
         if choice == ("5" if chat_fn is not None else "3"):
             accounts_menu(settings)
+            _clear_screen()
             continue
         if choice in ("q", "quit", "0", "exit"):
             return 0
