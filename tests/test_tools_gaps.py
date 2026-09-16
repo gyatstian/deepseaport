@@ -350,3 +350,83 @@ def test_parse_tool_calls_debug_miss_returns_unchanged(caplog):
         calls, rest = T.parse_tool_calls(text, tools)
     assert calls is None
     assert rest == text
+
+
+# --- new reliability fixes (large args, lenient JSON, tolerant DSML) ---
+
+def test_parse_tool_calls_accepts_large_write_arguments():
+    """The old 8k cap dropped ordinary file writes; default is now 200k."""
+    tools = [{"type": "function", "function": {"name": "write"}}]
+    payload = json.dumps({"filePath": "big.html", "content": "x" * 12_000})
+    text = json.dumps({"tool_calls": [{"id": "call_001", "type": "function",
+                                       "function": {"name": "write",
+                                                    "arguments": payload}}]})
+    calls, _ = T.parse_tool_calls(text, tools)
+    assert calls is not None
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert len(args["content"]) == 12_000
+
+
+def test_parse_tool_calls_repairs_raw_newlines_inside_arguments():
+    tools = [{"type": "function", "function": {"name": "write"}}]
+    raw_inner = ('{"filePath": "a.txt", "content": "line1' + chr(10)
+                 + 'line2"}')
+    escaped_inner = raw_inner.replace(chr(92), chr(92) * 2).replace(
+        '"', chr(92) + '"')
+    text = ('{"tool_calls": [{"function": {"name": "write", '
+            '"arguments": "' + escaped_inner + '"}}]}')
+    calls, _ = T.parse_tool_calls(text, tools)
+    assert calls is not None
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args["filePath"] == "a.txt"
+    assert args["content"] == "line1" + chr(10) + "line2"
+
+
+def test_parse_dsml_generic_close_tags():
+    lt, gt, ds = chr(60), chr(62), "||DSML||"
+    close = lt + "/" + gt
+    text = (lt + ds + "tool_calls" + gt
+            + lt + ds + 'invoke name="read"' + gt
+            + lt + ds + 'parameter name="filePath" string="true"' + gt
+            + "x.md" + close
+            + lt + ds + 'parameter name="limit" string="false"' + gt
+            + "3" + close
+            + close
+            + lt + "/" + ds + "tool_calls" + gt)
+    tools = [{"type": "function", "function": {"name": "read"}}]
+    calls, rest = T.parse_tool_calls(text, tools)
+    assert calls is not None
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "filePath": "x.md", "limit": 3}
+    assert rest == ""
+
+
+def test_parse_plain_invoke_parameter_without_dsml_prefix():
+    lt, gt = chr(60), chr(62)
+    text = (lt + 'invoke name="calc"' + gt
+            + lt + 'parameter name="e" string="true"' + gt
+            + "1+1" + lt + "/" + gt
+            + lt + "/" + gt)
+    tools = [{"type": "function", "function": {"name": "calc"}}]
+    calls, _ = T.parse_tool_calls(text, tools)
+    assert calls is not None
+    assert json.loads(calls[0]["function"]["arguments"])["e"] == "1+1"
+
+
+def test_looks_truncated_tool_attempt():
+    assert T.looks_truncated_tool_attempt(
+        '{"tool_calls": [{"function": {"name": "write"}]') is True
+    assert T.looks_truncated_tool_attempt('{"tool_calls": []}') is False
+    assert T.looks_truncated_tool_attempt("normal answer") is False
+
+
+def test_parse_tool_calls_recovers_unescaped_openai_arguments():
+    tools = [{"type": "function", "function": {"name": "write"}}]
+    text = ('{"tool_calls": [{"id": "call_001", "type": "function", '
+            '"function": {"name": "write", "arguments": "{"filePath": '
+            '"x.html", "content": "hello"}"}}]}')
+    calls, rest = T.parse_tool_calls(text, tools)
+    assert calls is not None
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "filePath": "x.html", "content": "hello"}
+    assert rest == ""

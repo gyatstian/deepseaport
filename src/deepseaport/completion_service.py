@@ -22,6 +22,7 @@ from . import protocol as P
 from .accounts import AccountPool, PooledAccount
 from .config import Settings, load_settings
 from .obscura_bridge import ObscuraBridge
+from .tools_support import looks_truncated_tool_attempt
 from .server_concurrency import (
     FAILOVER_ACQUIRE_TIMEOUT,
     INVALID_TOKEN_COOLDOWN_SECONDS,
@@ -1083,8 +1084,15 @@ def _openai_response(prep: dict, result: dict) -> dict:
     from .server import parse_tool_calls
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
-    calls, remaining = (parse_tool_calls(result["content"], prep["tools"])
-                        if prep["tools"] else (None, result["content"]))
+    limit = prep.get("tool_args_max_chars")
+    if prep["tools"]:
+        if limit:
+            calls, remaining = parse_tool_calls(
+                result["content"], prep["tools"], max_args_chars=limit)
+        else:
+            calls, remaining = parse_tool_calls(result["content"], prep["tools"])
+    else:
+        calls, remaining = None, result["content"]
     if prep["tools"] and not calls:
         logger.debug("no tool call parsed model=%s preview=%.200s",
                      prep.get("model"), (result["content"] or "")[:200])
@@ -1095,6 +1103,11 @@ def _openai_response(prep: dict, result: dict) -> dict:
     if calls:
         message["tool_calls"] = calls
         finish = "tool_calls"
+    elif prep["tools"] and looks_truncated_tool_attempt(result["content"], prep["tools"]):
+        # The upstream web protocol has no finish_reason. An unbalanced tool
+        # attempt means the reply was cut mid-call; report OpenAI's length
+        # signal so the harness can retry/split instead of showing raw markup.
+        finish = "length"
     pt = max(1, len(prep["prompt"]) // 4)
     ct = result.get("usage_total") or max(1, (len(result["content"]) + len(result["thinking"])) // 4)
     return {"id": cid, "object": "chat.completion", "created": created, "model": prep["model"],

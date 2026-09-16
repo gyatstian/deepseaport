@@ -8,7 +8,7 @@
 
 # notice
 - deepseek on the website feels lobotomized/lazy, though it's not that bad, and you can definitely make it much better with skills or good prompting. below inside the readme I added a voxel pagoda he made<br>
-- tool calling seems ok. most often fails on long/complicated ones so advise him to implement one by one and it will be ok<br>
+- tool calling is prompt-based. The bridge now prefers the raw DSML block format for code/file arguments, repairs common malformed JSON, allows 200000-char arguments (`tool_args_max_chars` / `DEEPSEAPORT_MAX_ARGS_CHARS`), and marks truncated attempts with `finish_reason: "length"`. For very large files, ask the model to write them in several smaller calls (one by one) rather than one giant call; upstream output length is still the hard limit.<br>
 - app needs https://aka.ms/vs/17/release/vc_redist.x64.exe beacuse of obscura
 
 # deepseaport — DeepSeek web2api (Obscura WAF + real-browser login)

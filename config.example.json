@@ -23,6 +23,7 @@
   "auto_delete_session": true,
   "max_retries": 1,
   "parallel_challenge_fetch": true,
+  "tool_args_max_chars": 200000,
   "use_multiple_accounts": true,
   "log_level": "INFO",
   "stream_mode": "live",

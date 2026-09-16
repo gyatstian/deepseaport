@@ -34,7 +34,13 @@ from . import protocol as P
 from .accounts import AccountPool, PooledAccount
 from .config import AccountConfig, Settings, load_settings
 from .obscura_bridge import ObscuraBridge, register_default_bridge
-from .tools_support import parse_tool_calls, render_prompt, tool_reminder_prompt, tool_system_prompt
+from .tools_support import (
+    looks_truncated_tool_attempt,
+    parse_tool_calls,
+    render_prompt,
+    tool_reminder_prompt,
+    tool_system_prompt,
+)
 
 # --- Re-exports from the split modules (historical public surface) ---------
 # Order matters only for readability; all names are importable from
@@ -175,14 +181,26 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
 
     async def _parse_stream_calls(content: str):
         """Tool-parse buffered content (tools requested); log when none found."""
-        calls, remaining = await asyncio.to_thread(parse_tool_calls, content, prep["tools"])
+        limit = prep.get("tool_args_max_chars")
+        if limit:
+            calls, remaining = await asyncio.to_thread(
+                parse_tool_calls, content, prep["tools"], max_args_chars=limit)
+        else:
+            calls, remaining = await asyncio.to_thread(
+                parse_tool_calls, content, prep["tools"])
+        truncated = False
         if not calls:
-            logger.debug("stream no tool call parsed model=%s preview=%.200s",
-                         prep.get("model"), (content or "")[:200])
-        return calls, remaining
+            truncated = bool(looks_truncated_tool_attempt(content, prep["tools"]))
+            if truncated:
+                logger.warning("stream tool call looks truncated model=%s preview=%.200s",
+                               prep.get("model"), (content or "")[:200])
+            else:
+                logger.debug("stream no tool call parsed model=%s preview=%.200s",
+                             prep.get("model"), (content or "")[:200])
+        return calls, remaining, truncated
 
-    def _tool_finish_chunks(calls):
-        """tool_call deltas + finish chunk; plain stop when no calls."""
+    def _tool_finish_chunks(calls, truncated: bool = False):
+        """tool_call deltas + finish chunk; length when a call was cut off."""
         if calls:
             for call in calls:
                 yield chunk({"tool_calls": [{
@@ -191,7 +209,7 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
                                  "arguments": call["function"]["arguments"]}}]})
             yield chunk({}, "tool_calls")
         else:
-            yield chunk({}, "stop")
+            yield chunk({}, "length" if truncated else "stop")
 
     # Bounded producer: one account-holding thread per stream, capped by the
     # shared executor so a parallel-subagent burst queues instead of piling
@@ -216,15 +234,16 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
                     return
                 if kind == "done":
                     thinking, content = payload["thinking"], payload["content"]
+                    truncated = False
                     if prep["tools"]:
-                        calls, remaining = await _parse_stream_calls(content)
+                        calls, remaining, truncated = await _parse_stream_calls(content)
                     else:
                         calls, remaining = None, content
                     if thinking:
                         yield chunk({"reasoning_content": thinking})
                     if remaining:
                         yield chunk({"content": remaining})
-                    for piece in _tool_finish_chunks(calls):
+                    for piece in _tool_finish_chunks(calls, truncated):
                         yield piece
                     yield b"data: [DONE]\n\n"
                     return
@@ -256,11 +275,11 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
             if kind == "done":
                 content = payload["content"]
                 if prep.get("tools"):
-                    calls, remaining = await _parse_stream_calls(content)
+                    calls, remaining, truncated = await _parse_stream_calls(content)
                     # Thinking already streamed live; emit only the remainder.
                     if remaining:
                         yield chunk({"content": remaining})
-                    for piece in _tool_finish_chunks(calls):
+                    for piece in _tool_finish_chunks(calls, truncated):
                         yield piece
                 else:
                     # Content already streamed live; just close.

@@ -2,13 +2,19 @@
 
 The web model has no native function calling, so we describe tools in a
 system prompt and parse the model's structured reply back into OpenAI
-`tool_calls`. Five reply formats are accepted (first match wins):
+`tool_calls`. DSML raw-value blocks are preferred for large/file arguments;
+JSON forms are accepted for short calls. Parsing tries (first match wins):
 
 1. {"tool_calls": [{"id":..,"type":"function","function":{"name":..,"arguments":..}}]}
 2. <tool_call>{"name":..,"arguments":{..}}</tool_call>  (aliases: function_call, invoke)
-3. DSML <||DSML|| invoke name=../parameter blocks> (ASCII + fullwidth)
+3. DSML invoke/parameter blocks, ASCII + fullwidth, named or generic close tags.
 4. ```json fenced object with tool_calls / name+arguments keys.
 5. Bare unfenced {"name":..,"arguments":..} (valid-names gated).
+6. Last-resort recovery of unescaped OpenAI-style `arguments`.
+
+Small model-output damage is repaired (raw control chars in strings, bare
+keys, trailing commas, Python literals). Individual argument size defaults
+to 200k chars (Settings.tool_args_max_chars / DEEPSEAPORT_MAX_ARGS_CHARS).
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ def _int_env(name: str, default: int) -> int:
     return val if val > 0 else default
 
 
-MAX_ARGS_CHARS = _int_env("DEEPSEAPORT_MAX_ARGS_CHARS", 8000)
+MAX_ARGS_CHARS = _int_env("DEEPSEAPORT_MAX_ARGS_CHARS", 200_000)
 MAX_BARE_OBJECTS = _int_env("DEEPSEAPORT_MAX_BARE_OBJECTS", 40)
 
 
@@ -46,11 +52,34 @@ def _valid_names(tools: list[dict] | None) -> set[str]:
     return valid
 
 
-def tool_system_prompt(tools: list[dict]) -> str:
-    lines = ["You have access to the following tools. Use them when they help answer.",
+def _example_param_value(pinfo) -> str:
+    if not isinstance(pinfo, dict):
+        return "value"
+    ptype = str(pinfo.get("type", "string") or "string").lower()
+    if ptype in ("integer", "number"):
+        return "0"
+    if ptype == "boolean":
+        return "true"
+    if ptype == "array":
+        return "[]"
+    if ptype == "object":
+        return "{}"
+    return "value"
+
+
+def tool_system_prompt(tools: list[dict], max_args_chars: int | None = None) -> str:
+    lt = chr(60)
+    gt = chr(62)
+    ds = "||DSML||"
+    op = lt + ds
+    cl = lt + "/" + ds
+    lines = ["You have access to the following tools. Call one when it helps.",
              ""]
+    first_fn: dict = {}
     for tool in tools:
         fn = tool.get("function", {}) if isinstance(tool, dict) else {}
+        if not first_fn and isinstance(fn, dict) and fn.get("name"):
+            first_fn = fn
         name = fn.get("name", "unknown")
         desc = fn.get("description", "")
         params = fn.get("parameters", {}) or {}
@@ -67,22 +96,42 @@ def tool_system_prompt(tools: list[dict]) -> str:
                 mark = " (required)" if pname in required else ""
                 lines.append(f"  - {pname}: {ptype}{mark} - {pdesc}")
         lines.append("")
+
     names = sorted(_valid_names(tools))
+    example_name = first_fn.get("name", "tool_name")
+    example_props = (first_fn.get("parameters", {}) or {}).get("properties", {}) or {}
+    example_required = list((first_fn.get("parameters", {}) or {}).get("required", []) or [])
+    example_params = example_required or list(example_props)[:2] or ["param"]
+    example_values = {
+        pname: _example_param_value(example_props.get(pname, {}))
+        for pname in example_params
+    }
+    call_lines = [op + "tool_calls" + gt,
+                  op + f'invoke name="{example_name}"' + gt]
+    for pname in example_params:
+        call_lines.append(
+            op + f'parameter name="{pname}" string="true"' + gt
+            + example_values[pname] + cl + "parameter" + gt)
+    call_lines += [cl + "invoke" + gt, cl + "tool_calls" + gt]
+
+    arg_limit = max_args_chars if (isinstance(max_args_chars, int)
+                                 and max_args_chars > 0) else MAX_ARGS_CHARS
     lines += [
-        "To call tools, reply with ONLY this JSON object and nothing else:",
-        '{"tool_calls": [{"id": "call_001", "type": "function", '
-        '"function": {"name": "tool_name", "arguments": "{\\"param\\": \\"value\\"}"}}]}',
+        "PREFERRED call format (raw values; quotes, backslashes, newlines and HTML do NOT need escaping):",
+        *call_lines,
         "",
         "Rules:",
-        '- "arguments" must be a JSON-encoded string, never a nested object.',
-        "- Put parallel calls in one array with ids call_001, call_002, ...",
-        "- If no tool is needed, answer normally without any JSON.",
+        "- Prefer the DSML block format above. Use it for any call with file content, code or a shell command.",
+        "- Use the exact tool name and parameter names shown in the schema above; never rename parameters.",
+        "- Include every parameter marked (required).",
+        "- Output ONLY the tool call. No prose, no Thought:, no Markdown fences, no extra wrapper tags.",
+        "- Put parallel calls in one DSML tool_calls block (multiple invoke blocks).",
+        "- Keep each call's arguments below " + f"{arg_limit:,}" + " characters. If a file or command is larger, split it into sequential smaller calls: write one chunk, then append the next chunk in later calls. The upstream model output is truncated on very long replies, so one giant call will fail.",
+        "- If no tool is needed, answer normally without any tool markup.",
         "- After tool results arrive, use them and answer the user.",
-        "- Preferred format is the JSON object above (no prose before or after).",
-        "- Alternatives also accepted:",
-        '  <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>,',
-        "  ```json fenced object with tool_calls or name+arguments keys,",
-        "  or <||DSML|| invoke name=...><||DSML|| parameter name=...>...</> blocks (ASCII or fullwidth).",
+        "",
+        "A short JSON form is also accepted for simple calls (arguments may be an object or a JSON string):",
+        '{"tool_calls": [{"id": "call_001", "type": "function", "function": {"name": "tool_name", "arguments": {"param": "value"}}}]}',
     ]
     if names:
         lines.append(f"Valid tool names: {', '.join(names)}. Do not invent other names.")
@@ -96,10 +145,11 @@ def tool_reminder_prompt(tools: list[dict] | None = None) -> str:
     bury it, so this repeats only the output contract at the end.
     """
     names = sorted(_valid_names(tools))
-    base = ("Reminder: if you need a tool, reply with ONLY "
-            '{"tool_calls": [...]} and nothing else (no prose before or after; '
-            "DSML / <tool_call> / fenced equivalents also accepted). "
-            "If no tool is needed, answer normally.")
+    base = ("Reminder: to call a tool, output ONLY a DSML tool_calls block "
+            "(preferred; JSON tool_calls also accepted). Use the exact parameter "
+            "names from the schema. Raw DSML parameter values need no escaping. "
+            "If file content or a command is large, send several smaller calls "
+            "instead of one oversized call. If no tool is needed, answer normally.")
     if names:
         base += f" Valid names: {', '.join(names)}."
     return base
@@ -193,6 +243,204 @@ def _balanced_json(text: str, start: int) -> str | None:
     return None
 
 
+_LOOSE_JSON_MISS = object()
+
+
+def _escape_control_chars_in_strings(text: str) -> str:
+    """Escape raw control characters that models commonly put inside JSON strings.
+
+    ``json.loads`` rejects a literal newline/tab inside a quoted value. Models
+    frequently emit file content and shell commands that way, which is one of
+    the main reasons a structurally valid tool call turns into "no tool call
+    parsed". This repair keeps already-escaped sequences untouched.
+    """
+    out: list[str] = []
+    in_str = False
+    esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                out.append(ch)
+                esc = False
+            elif ch == "\\":
+                out.append(ch)
+                esc = True
+            elif ch == '"':
+                out.append(ch)
+                in_str = False
+            elif ch == "\n":
+                out.append("\\n")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\t":
+                out.append("\\t")
+            elif ord(ch) < 0x20:
+                out.append("\\u%04x" % ord(ch))
+            else:
+                out.append(ch)
+        else:
+            out.append(ch)
+            if ch == '"':
+                in_str = True
+    return "".join(out)
+
+
+def _remove_trailing_commas(text: str) -> str:
+    """Drop trailing commas before ``}``/``]`` outside string literals."""
+    out: list[str] = []
+    in_str = False
+    esc = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                i += 1  # skip comma, whitespace is handled on the next loop
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _quote_unquoted_keys(text: str) -> str:
+    """Quote bare object keys (``{foo: 1}``) outside strings."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_str = False
+    esc = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch in "{,":
+            out.append(ch)
+            i += 1
+            while i < n and text[i].isspace():
+                out.append(text[i])
+                i += 1
+            if i < n and (text[i].isalpha() or text[i] == "_"):
+                j = i
+                while j < n and (text[j].isalnum() or text[j] in "_.-"):
+                    j += 1
+                k = j
+                while k < n and text[k].isspace():
+                    k += 1
+                if k < n and text[k] == ":":
+                    out.append('"' + text[i:j] + '"')
+                    i = j
+                    continue
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _replace_python_literals(text: str) -> str:
+    """Replace ``True``/``False``/``None`` outside strings with JSON values."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_str = False
+    esc = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch.isalpha() or ch == "_":
+            j = i
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            word = text[i:j]
+            repl = {"True": "true", "False": "false", "None": "null"}.get(word, word)
+            out.append(repl)
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _loads_json_lenient(text: str):
+    """Parse JSON with small, safe repairs for common model-output damage.
+
+    Returns ``_LOOSE_JSON_MISS`` when nothing usable could be produced. Only
+    used after strict ``json.loads`` failed, so valid JSON is never changed.
+    """
+    if not isinstance(text, str):
+        return _LOOSE_JSON_MISS
+    candidate = text.strip()
+    if not candidate:
+        return _LOOSE_JSON_MISS
+    try:
+        return json.loads(candidate)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    repaired = _replace_python_literals(
+        _quote_unquoted_keys(
+            _remove_trailing_commas(
+                _escape_control_chars_in_strings(candidate))))
+    try:
+        return json.loads(repaired)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    # Python-style dicts (single quotes / True / None) still occur when a
+    # model is asked for an "arguments" object.
+    try:
+        import ast
+        value = ast.literal_eval(candidate)
+        if isinstance(value, (dict, list)):
+            return value
+    except Exception:
+        pass
+    return _LOOSE_JSON_MISS
+
+
 class _OversizeArgs(ValueError):
     """Internal signal: arguments exceed the configured limit; caller drops."""
 
@@ -218,10 +466,19 @@ def _normalize_args(args, call_idx: int, max_args_chars: int | None = None) -> s
             raise _OversizeArgs(f"arguments exceed {limit} chars")
         try:
             json.loads(candidate)
+            return candidate
         except json.JSONDecodeError:
+            repaired = _loads_json_lenient(candidate)
+            if repaired is not _LOOSE_JSON_MISS:
+                dumped = json.dumps(repaired, ensure_ascii=False)
+                if len(dumped) > limit:
+                    logger.warning("rejecting oversize tool arguments (%d chars > %d)",
+                                   len(dumped), limit)
+                    raise _OversizeArgs(f"arguments exceed {limit} chars")
+                logger.info("tool call %d arguments repaired by lenient JSON parser", call_idx)
+                return dumped
             logger.warning("tool call %d has non-JSON arguments; wrapping", call_idx)
             return json.dumps({"_raw": candidate}, ensure_ascii=False)
-        return candidate
     dumped = json.dumps(args, ensure_ascii=False)
     if len(dumped) > limit:
         logger.warning("rejecting oversize tool arguments (%d chars > %d)", len(dumped), limit)
@@ -329,45 +586,146 @@ def _coerce_dsml_value(value: str, string_attr: str | None):
     return v
 
 
-def _parse_dsml_calls(text: str) -> list[dict]:
-    """Parse <||DSML|| invoke name=...><||DSML|| parameter ...>...</> blocks."""
+_LT = chr(60)
+_GT = chr(62)
+_DS = "||DSML||"
+_SP = "[ ]*"
+
+
+def _tag_re(name: str, *, closing: bool = False) -> re.Pattern:
+    prefix = _LT + ("/" if closing else "")
+    return re.compile(
+        re.escape(prefix) + _SP + "(?:" + re.escape(_DS) + ")?" + _SP
+        + name + _SP + _GT,
+        re.IGNORECASE,
+    )
+
+
+_INVOKE_OPEN_RE = re.compile(
+    re.escape(_LT) + _SP + "(?:" + re.escape(_DS) + ")?" + _SP
+    + "invoke([^>]*)>",
+    re.IGNORECASE,
+)
+_PARAM_OPEN_RE = re.compile(
+    re.escape(_LT) + _SP + "(?:" + re.escape(_DS) + ")?" + _SP
+    + "parameter([^>]*)>",
+    re.IGNORECASE,
+)
+_INVOKE_CLOSE_RE = _tag_re("invoke", closing=True)
+_PARAM_CLOSE_RE = _tag_re("parameter", closing=True)
+_GENERIC_CLOSE_RE = re.compile(re.escape(_LT + "/>"))
+
+
+def _parse_dsml_attrs(attr_text: str) -> dict[str, str]:
+    """Parse ``name="value"`` / ``name='value'`` / ``name=value`` attributes."""
+    attrs: dict[str, str] = {}
+    i = 0
+    n = len(attr_text)
+    while i < n:
+        while i < n and attr_text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        j = i
+        while j < n and (attr_text[j].isalnum() or attr_text[j] in "_-:."):
+            j += 1
+        name = attr_text[i:j].lower()
+        while j < n and attr_text[j].isspace():
+            j += 1
+        if name and j < n and attr_text[j] == "=":
+            j += 1
+            while j < n and attr_text[j].isspace():
+                j += 1
+            if j < n and attr_text[j] in "'\"":
+                quote = attr_text[j]
+                j += 1
+                k = attr_text.find(quote, j)
+                if k < 0:
+                    k = n
+                value = attr_text[j:k]
+                j = min(k + 1, n)
+            else:
+                k = j
+                while k < n and not attr_text[k].isspace():
+                    k += 1
+                value = attr_text[j:k]
+                j = k
+            attrs[name] = value
+        i = j + (0 if j > i else 1)
+    return attrs
+
+
+def _find_close(text: str, start: int, end: int,
+                specific: re.Pattern) -> re.Match | None:
+    m = specific.search(text, start, end)
+    g = _GENERIC_CLOSE_RE.search(text, start, end)
+    if m and g:
+        return m if m.start() <= g.start() else g
+    return m or g
+
+
+def _scan_dsml_calls(text: str) -> tuple[list[dict], list[tuple[int, int]]]:
+    """Tolerant DSML scanner (canonical, plain tags, generic close tags)."""
     norm = _normalize_dsml_text(text)
-    invoke_pat = re.compile(
-        r"<\|\|DSML\|\|\s*invoke\b([^>]*)>(.*?)</\|\|DSML\|\|\s*invoke\s*>",
-        re.DOTALL | re.IGNORECASE,
-    )
-    param_pat = re.compile(
-        r"<\|\|DSML\|\|\s*parameter\b([^>]*)>(.*?)</\|\|DSML\|\|\s*parameter\s*>",
-        re.DOTALL | re.IGNORECASE,
-    )
-    attr_pat = re.compile(r'(\w+)\s*=\s*(".*?"|\'.*?\'|\S+)')
+    opens = list(_INVOKE_OPEN_RE.finditer(norm))
     out: list[dict] = []
-    for inv in invoke_pat.finditer(norm):
-        attrs = dict((k.lower(), v.strip('"\''))
-                     for k, v in attr_pat.findall(inv.group(1) or ""))
+    spans: list[tuple[int, int]] = []
+    for idx, inv in enumerate(opens):
+        body_start = inv.end()
+        body_end = opens[idx + 1].start() if idx + 1 < len(opens) else len(norm)
+        attrs = _parse_dsml_attrs(inv.group(1) or "")
         name = attrs.get("name")
         if not name:
             continue
+        named_close = _INVOKE_CLOSE_RE.search(norm, body_start, body_end)
+        param_limit = named_close.start() if named_close else body_end
         args: dict = {}
-        for pm in param_pat.finditer(inv.group(2) or ""):
-            pattrs = dict((k.lower(), v.strip('"\''))
-                          for k, v in attr_pat.findall(pm.group(1) or ""))
+        last_param_end = body_start
+        params = list(_PARAM_OPEN_RE.finditer(norm, body_start, param_limit))
+        for pidx, pm in enumerate(params):
+            value_start = pm.end()
+            value_limit = (params[pidx + 1].start()
+                           if pidx + 1 < len(params) else param_limit)
+            pclose = _find_close(norm, value_start, value_limit, _PARAM_CLOSE_RE)
+            value_stop = pclose.start() if pclose else value_limit
+            pattrs = _parse_dsml_attrs(pm.group(1) or "")
             pname = pattrs.get("name")
-            if not pname:
-                continue
-            args[pname] = _coerce_dsml_value(pm.group(2) or "", pattrs.get("string"))
+            if pname:
+                args[pname] = _coerce_dsml_value(
+                    norm[value_start:value_stop], pattrs.get("string"))
+            last_param_end = max(last_param_end,
+                                 pclose.end() if pclose else value_stop)
+        if named_close:
+            inv_close = named_close
+        else:
+            # Generic closers pair in order: each parameter consumes the
+            # closer after its value; the next one closes the invoke.
+            generic = _GENERIC_CLOSE_RE.search(norm, last_param_end, body_end)
+            inv_close = generic
         out.append({"function": {"name": name, "arguments": args}})
-    return out
+        span_end = inv_close.end() if inv_close else body_end
+        spans.append((inv.start(), span_end))
+    return out, spans
+
+
+def _parse_dsml_calls(text: str) -> list[dict]:
+    """Parse DSML / plain invoke+parameter blocks into raw tool calls."""
+    calls, _ = _scan_dsml_calls(text)
+    return calls
 
 
 def _dsml_spans(text: str) -> list[tuple[int, int]]:
-    """Spans to strip on DSML success (computed on normalized text)."""
+    """Spans to strip on DSML success (length-preserving normalization)."""
     norm = _normalize_dsml_text(text)
     spans: list[tuple[int, int]] = []
-    for pat in (r"<\|\|DSML\|\|\s*calls\s*>", r"</\|\|DSML\|\|\s*calls\s*>",
-                r"<\|\|DSML\|\|\s*invoke\b[^>]*>.*?</\|\|DSML\|\|\s*invoke\s*>"):
-        for m in re.finditer(pat, norm, re.DOTALL | re.IGNORECASE):
-            spans.append((m.start(), m.end()))
+    for tag in ("calls", "tool_calls"):
+        for rx in (_tag_re(tag), _tag_re(tag, closing=True)):
+            for m in rx.finditer(norm):
+                spans.append((m.start(), m.end()))
+    # The tolerant scanner owns invoke/parameter/plain/generic blocks. Its
+    # normalized copy is length-preserving, so positions map to `text`.
+    _, invoke_spans = _scan_dsml_calls(text)
+    spans.extend(invoke_spans)
     return spans
 
 
@@ -400,9 +758,8 @@ def _parse_bare_name_objects(
             continue
         count += 1
         pos = start + len(obj_text)
-        try:
-            obj = json.loads(obj_text)
-        except json.JSONDecodeError:
+        obj = _loads_json_lenient(obj_text)
+        if obj is _LOOSE_JSON_MISS:
             continue
         if not isinstance(obj, dict):
             continue
@@ -454,7 +811,119 @@ def _looks_like_tool_attempt(text: str, valid: set[str] | None) -> bool:
     return False
 
 
+def looks_truncated_tool_attempt(text: str, tools: list[dict] | None = None) -> bool:
+    """Best-effort signal that a tool attempt was cut off mid-output.
+
+    DeepSeek web has no finish_reason, so a model reply truncated by the
+    upstream token limit arrives exactly like a normal stop. If the reply
+    clearly looks like a tool call and JSON/DSML delimiters are unbalanced,
+    callers can report ``finish_reason: "length"`` so harnesses retry or
+    split the request instead of treating raw markup as the final answer.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    low = text.lower()
+    strong = ('"tool_calls"' in low or "<tool_calls" in low or "<tool_call"
+              in low or "dsml" in low or "<invoke" in low
+              or "<function_call" in low)
+    if not strong:
+        return False
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    closes = {"{": "}", "[": "]", "(": ")"}
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ord(ch) == 92:  # backslash
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in closes:
+            stack.append(closes[ch])
+        elif ch in "}])":
+            if not stack or stack.pop() != ch:
+                return True
+    if stack or in_str:
+        return True
+    # DSML/XML-style blocks can be truncated without unbalanced braces.
+    if "dsml" in low or "<invoke" in low:
+        lt = chr(60)
+        ds = "||dsml||"
+        generic_close = low.count(lt + "/" + chr(62))
+        for tag in ("tool_calls", "calls", "invoke", "parameter"):
+            opened = low.count(lt + ds + tag)
+            closed = low.count(lt + "/" + ds + tag)
+            if opened > closed + generic_close:
+                return True
+    return False
+
+
 _FENCED_BLOCK_RE = re.compile(r"```(?:\w+)?\s*(.*?)```", re.DOTALL)
+
+
+def _recover_loose_openai_call(text: str, valid: set[str] | None,
+                                limit_args: int):
+    """Last-resort recovery for an unescaped OpenAI tool-call JSON attempt.
+
+    Models often write ``"arguments": "{"path": ..., "content": ...}"`` (the
+    inner JSON was not escaped).  Strict parsing rejects it, but the intended
+    payload is usually recoverable by taking the outer quote before the final
+    call delimiters and parsing the inner object leniently.  Only attempted
+    after every normal format failed, so valid replies are unchanged.
+    """
+    if not valid or text.count('"arguments"') != 1:
+        return None
+    low = text.lower()
+    if '"tool_calls"' not in low and '"function"' not in low:
+        return None
+    m = re.search(r'"arguments"[ ]*:[ ]*', text)
+    if m is None:
+        return None
+    value_start = m.end()
+    if value_start >= len(text):
+        return None
+    if text[value_start] == '"':
+        end = text.rfind('"')
+        if end <= value_start:
+            return None
+        raw = text[value_start + 1:end]
+    elif text[value_start] in "{[":
+        raw = _balanced_json(text, value_start)
+        if not raw:
+            return None
+    else:
+        return None
+    parsed = _loads_json_lenient(raw)
+    if parsed is _LOOSE_JSON_MISS and isinstance(raw, str):
+        parsed = _loads_json_lenient(raw.strip())
+    if parsed is _LOOSE_JSON_MISS:
+        return None
+    if isinstance(parsed, str):
+        parsed = _loads_json_lenient(parsed)
+    if parsed is _LOOSE_JSON_MISS or not isinstance(parsed, (dict, list)):
+        return None
+    lower_map = {n.lower(): n for n in valid if isinstance(n, str)}
+    name = None
+    for candidate in reversed(re.findall(r'"name"[ ]*:[ ]*"([^"]+)"',
+                                         text[:value_start])):
+        if candidate in valid:
+            name = candidate
+            break
+        mapped = lower_map.get(candidate.lower())
+        if mapped:
+            name = mapped
+            break
+    if not name:
+        return None
+    calls, _ = _normalize_calls([{"function": {"name": name,
+                                               "arguments": parsed}}],
+                                valid, limit_args)
+    return calls or None
 
 
 def parse_tool_calls(
@@ -500,9 +969,8 @@ def parse_tool_calls(
         if '"tool_calls"' not in obj_text:
             pos = start + len(obj_text)
             continue
-        try:
-            obj = json.loads(obj_text)
-        except json.JSONDecodeError:
+        obj = _loads_json_lenient(obj_text)
+        if obj is _LOOSE_JSON_MISS:
             pos = start + 1
             continue
         raw = obj.get("tool_calls") if isinstance(obj, dict) else None
@@ -520,9 +988,8 @@ def parse_tool_calls(
     )
     tagged = []
     for m in tag_pat.finditer(text):
-        try:
-            obj = json.loads(m.group(1).strip())
-        except json.JSONDecodeError:
+        obj = _loads_json_lenient(m.group(1).strip())
+        if obj is _LOOSE_JSON_MISS:
             continue
         if isinstance(obj, dict) and obj.get("name"):
             tagged.append({"function": obj})
@@ -534,8 +1001,11 @@ def parse_tool_calls(
             rest = _clean_rest(tag_pat.sub("", text))
             return calls, rest
 
-    # Format 3: DSML invoke/parameter blocks.
-    if "dsml" in text.lower():
+    # Format 3: DSML / plain invoke+parameter blocks. The scanner is gated
+    # on an invoke tag or DSML marker so ordinary prose with angle brackets
+    # is not scanned.
+    low = text.lower()
+    if "dsml" in low or "<invoke" in low:
         dsml_raw = _parse_dsml_calls(text)
         if dsml_raw:
             calls, dropped = _normalize_calls(dsml_raw, valid_or_none, limit_args)
@@ -563,9 +1033,8 @@ def parse_tool_calls(
             if not obj_text:
                 inner_pos = obj_start + 1
                 continue
-            try:
-                obj = json.loads(obj_text)
-            except json.JSONDecodeError:
+            obj = _loads_json_lenient(obj_text)
+            if obj is _LOOSE_JSON_MISS:
                 inner_pos = obj_start + 1
                 continue
             raw = None
@@ -591,6 +1060,13 @@ def parse_tool_calls(
                 # Strip only the spans that survived normalization.
                 rest = _clean_rest(_strip_spans(text, bare_spans))
                 return calls, rest
+
+    # Last resort: recover an unescaped OpenAI-style JSON attempt, e.g.
+    # "arguments": "{"path": ...}" where the inner object was not escaped.
+    recovered = _recover_loose_openai_call(text, valid_or_none, limit_args)
+    if recovered:
+        logger.info("recovered loose OpenAI tool call (%d call(s))", len(recovered))
+        return recovered, ""
 
     if tools and _looks_like_tool_attempt(text, valid):
         logger.debug("tool parse miss preview=%.300s", text[:300])

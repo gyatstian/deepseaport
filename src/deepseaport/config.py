@@ -106,6 +106,10 @@ class Settings:
     auto_delete_session: bool = True
     max_retries: int = 1
     parallel_challenge_fetch: bool = True
+    # Reject tool-call arguments above this many characters before the
+    # harness sees them. 200k keeps large single-file writes possible while
+    # still bounding memory; the old 8k default dropped ordinary file writes.
+    tool_args_max_chars: int = 200_000
     # True -> busy CURRENT fails over to another healthy account (parallel
     # subagents / multitasking). False -> stick to CURRENT, queue on it.
     use_multiple_accounts: bool = True
@@ -139,6 +143,7 @@ class Settings:
             "auto_delete_session": self.auto_delete_session,
             "max_retries": self.max_retries,
             "parallel_challenge_fetch": self.parallel_challenge_fetch,
+            "tool_args_max_chars": self.tool_args_max_chars,
             "use_multiple_accounts": self.use_multiple_accounts,
             "log_level": self.log_level,
             "stream_mode": self.stream_mode,
@@ -307,6 +312,10 @@ def load_settings(path: str | None = None) -> Settings:
         max_retries=_int("DEEPSEAPORT_MAX_RETRIES", "max_retries", 1),
         parallel_challenge_fetch=_bool(
             "DEEPSEAPORT_PARALLEL_FETCH", "parallel_challenge_fetch", True),
+        tool_args_max_chars=(
+            _int("DEEPSEAPORT_MAX_ARGS_CHARS", "tool_args_max_chars", 200_000)
+            or 200_000
+        ),
         use_multiple_accounts=_bool(
             "DEEPSEAPORT_USE_MULTIPLE_ACCOUNTS", "use_multiple_accounts", True),
         log_level=_str("DEEPSEAPORT_LOG_LEVEL", "log_level", "INFO", VALID_LOG_LEVELS),

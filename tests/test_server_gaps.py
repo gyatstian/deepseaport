@@ -120,6 +120,13 @@ def test_prepare_tool_choice_none_disables():
     assert prep["tools"] == []
 
 
+def test_prepare_uses_settings_tool_args_limit():
+    s = _settings(tool_args_max_chars=1234)
+    prep = _prepare(_tools_body(), s)
+    assert prep["tool_args_max_chars"] == 1234
+    assert "1,234" in prep["prompt"]
+
+
 def test_prepare_settings_none_keeps_tools():
     prep = _prepare(_tools_body(), None)
     assert len(prep["tools"]) == 1
@@ -414,3 +421,14 @@ def test_openai_response_tool_calls_shape(monkeypatch):
     msg = out["choices"][0]["message"]
     assert msg["tool_calls"] == calls
     assert out["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_openai_response_truncated_tool_attempt_marks_length(monkeypatch):
+    monkeypatch.setattr(
+        "deepseaport.server.parse_tool_calls",
+        lambda content, tools: (None, content))
+    prep = _base_prep(tools=[{"function": {"name": "get_time"}}])
+    out = _openai_response(
+        prep, {"content": '{"tool_calls": [{"function": {"name": "get_time"}',
+               "thinking": "", "usage_total": 3})
+    assert out["choices"][0]["finish_reason"] == "length"

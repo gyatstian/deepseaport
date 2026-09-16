@@ -308,8 +308,18 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
     use_tools = bool(tools) and body.get("tool_choice", "auto") != "none"
     if settings is not None and not getattr(settings, "enable_tools", True):
         use_tools = False
+    tool_args_max_chars = None
+    if settings is not None:
+        try:
+            tool_args_max_chars = int(
+                getattr(settings, "tool_args_max_chars", 0) or 0) or None
+        except (TypeError, ValueError):
+            tool_args_max_chars = None
     if use_tools:
-        messages = [{"role": "system", "content": tool_system_prompt(tools)}, *messages]
+        messages = [{"role": "system",
+                     "content": tool_system_prompt(
+                         tools, max_args_chars=tool_args_max_chars)},
+                    *messages]
     prompt = render_prompt(messages)
     if use_tools:
         # Recency reminder: long histories bury the start instruction.
@@ -323,5 +333,6 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
     return {
         "model": model, "stream": bool(body.get("stream", False)),
         "tools": tools if use_tools else [], "prompt": prompt,
+        "tool_args_max_chars": tool_args_max_chars,
         "thinking": thinking, "search": search, "model_type": model_type,
     }

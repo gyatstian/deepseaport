@@ -115,12 +115,19 @@ bad (cooldown) on ban/restricted/401.
 Web model has no native function calling. `tools_support.render_prompt()`
 flattens OpenAI messages (`<User>`/`<Assistant>…<endofsentence>` markers,
 `[I called tools: …]` records, `Tool <name> returned: …` results as user
-turns); `tool_system_prompt()` injects schemas; `parse_tool_calls()` accepts
-`{"tool_calls":[…]}` (balanced-brace scan), `<tool_call>`/`<function_call>`/
-`<invoke>` tags, and fenced-json fallback; unknown names dropped, args
-normalized to JSON strings, ids `call_001…`. Stream and non-stream both end
-with `finish_reason: "tool_calls"`. Multi-step loops verified live
-(weather → tool result → final answer).
+turns); `tool_system_prompt()` injects schemas and now prefers the raw DSML
+`tool_calls` / `invoke` / `parameter` block format, because raw parameter
+values do not need JSON escaping. `parse_tool_calls()` accepts DSML (ASCII
+and fullwidth), `{"tool_calls":[…]}` (balanced-brace scan),
+`<tool_call>`/`<function_call>`/`<invoke>` JSON tags, fenced JSON, bare
+name+arguments objects, and a last-resort recovery for unescaped
+OpenAI-style `arguments`. Unknown names are dropped, args are normalized to
+JSON strings, ids are `call_001…`. Per-argument size is capped by
+`Settings.tool_args_max_chars` / `DEEPSEAPORT_MAX_ARGS_CHARS` (default
+200000); replies that look like a truncated tool attempt surface
+`finish_reason: "length"` instead of masquerading as a normal stop.
+Stream and non-stream both end with `finish_reason: "tool_calls"`.
+Multi-step loops verified live (weather → tool result → final answer).
 
 ## Models (v4.1 lineup, Sep 2026)
 
@@ -176,7 +183,7 @@ variants under old names, `deepseek-vision`.
 
 ## Environment / files
 
-- `config.json` (gitignored): `{keys, accounts[{email,mobile,password,token,banned,banned_until}], active_account, obscura_bin, obscura_profile, browser_bin, browser_headless, port, listen, enable_tools, warmup_on_startup, auto_delete_session, max_retries, parallel_challenge_fetch, use_multiple_accounts, log_level, stream_mode, chat_model}`.
+- `config.json` (gitignored): `{keys, accounts[{email,mobile,password,token,banned,banned_until}], active_account, obscura_bin, obscura_profile, browser_bin, browser_headless, port, listen, enable_tools, warmup_on_startup, auto_delete_session, max_retries, parallel_challenge_fetch, tool_args_max_chars, use_multiple_accounts, log_level, stream_mode, chat_model}`.
   `AccountConfig.__post_init__` normalizes pasted token JSON (including
   `{"value":null}`) through `tokens.py`, so broken shapes become an empty token
   instead of a mysterious 40003 later. Bans found by the server/login page are
