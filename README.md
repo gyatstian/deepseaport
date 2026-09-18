@@ -6,9 +6,6 @@
 - *optionally play around with settings or/and config.json!*
 - base url: http://127.0.0.1:5001/v1
 
-# notice
-- deepseek on the website feels lobotomized/lazy, though it's not that bad, and you can definitely make it much better with skills or good prompting. below inside the readme I added a voxel pagoda he made<br>
-- tool calling is prompt-based. The bridge now prefers the raw DSML block format for code/file arguments, repairs common malformed JSON, allows 200000-char arguments (`tool_args_max_chars` / `DEEPSEAPORT_MAX_ARGS_CHARS`), and marks truncated attempts with `finish_reason: "length"`. Opt-in `forgiving_toolcalls` / `DEEPSEAPORT_FORGIVING_TOOLCALLS` repairs common model slips (pipe/space/HTML-escaped markers, smart attribute delimiters, single-tool missing-name/param inference, JSON invoke bodies; values never invented). For very large files, ask the model to write them in several smaller calls (one by one) rather than one giant call; upstream output length is still the hard limit.<br>
 - app needs https://aka.ms/vs/17/release/vc_redist.x64.exe beacuse of obscura
 
 # deepseaport — DeepSeek web2api (Obscura WAF + real-browser login)
