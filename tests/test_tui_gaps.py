@@ -415,9 +415,53 @@ def test_settings_menu_toggle_parallel(monkeypatch):
     assert s.parallel_challenge_fetch is False
 
 
+def test_edit_append_text_backslash_n_expands_live(monkeypatch):
+    s = _fresh()
+    inputs = iter(["line one\\nline two"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+    tui._edit_append_text(s, "append_top", "Append at top")
+    assert s.append_top == "line one\nline two"
+
+
+def test_edit_append_text_empty_cancels(monkeypatch):
+    s = _fresh(append_top="keep")
+    inputs = iter([""])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+    tui._edit_append_text(s, "append_top", "Append at top")
+    assert s.append_top == "keep"
+
+
+def test_edit_append_text_clear_empties(monkeypatch):
+    s = _fresh(append_top="keep")
+    inputs = iter(["clear"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+    tui._edit_append_text(s, "append_top", "Append at top")
+    assert s.append_top == ""
+
+
+def test_read_interactive_non_tty_unescapes(monkeypatch):
+    import sys
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "a\\nb")
+    assert tui._read_interactive("Label: ") == "a\nb"
+
+
+def test_unescape_newlines_double_backslash(monkeypatch):
+    assert tui._unescape_newlines("a\\\\nb") == "a\\nb"
+
+
+def test_settings_menu_toggle_dry_frontend(monkeypatch):
+    s = _fresh(send_dry_run_to_frontend=True)
+    inputs = iter(["6", "q"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+    settings_menu(s)
+    assert s.send_dry_run_to_frontend is False
+
+
 def test_settings_menu_log_level_invalid_keeps(monkeypatch):
     s = _fresh(log_level="INFO")
-    inputs = iter(["6", "bogus", "q"])
+    inputs = iter(["7", "bogus", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     settings_menu(s)
     assert s.log_level == "INFO"
@@ -425,7 +469,7 @@ def test_settings_menu_log_level_invalid_keeps(monkeypatch):
 
 def test_settings_menu_log_level_valid_changes(monkeypatch):
     s = _fresh(log_level="INFO")
-    inputs = iter(["6", "DEBUG", "q"])
+    inputs = iter(["7", "DEBUG", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     settings_menu(s)
     assert s.log_level == "DEBUG"
@@ -433,7 +477,7 @@ def test_settings_menu_log_level_valid_changes(monkeypatch):
 
 def test_settings_menu_toggle_stream(monkeypatch):
     s = _fresh(stream_mode="live")
-    inputs = iter(["7", "q"])
+    inputs = iter(["8", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     settings_menu(s)
     assert s.stream_mode == "buffered"
@@ -441,7 +485,7 @@ def test_settings_menu_toggle_stream(monkeypatch):
 
 def test_settings_menu_toggle_listen(monkeypatch):
     s = _fresh(listen=False)
-    inputs = iter(["8", "q"])
+    inputs = iter(["9", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     settings_menu(s)
     assert s.listen is True
@@ -455,7 +499,7 @@ def test_settings_menu_port_routed(monkeypatch):
         called["n"] += 1
 
     monkeypatch.setattr(tui, "_edit_port", _fake)
-    inputs = iter(["9", "q"])
+    inputs = iter(["10", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     settings_menu(s)
     assert called["n"] == 1
@@ -469,7 +513,7 @@ def test_settings_menu_keys_routed(monkeypatch):
         called["n"] += 1
 
     monkeypatch.setattr(tui, "_edit_keys", _fake)
-    inputs = iter(["10", "q"])
+    inputs = iter(["11", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     settings_menu(s)
     assert called["n"] == 1
@@ -477,7 +521,7 @@ def test_settings_menu_keys_routed(monkeypatch):
 
 def test_settings_menu_obscura_invalid_keeps(monkeypatch):
     s = _fresh(obscura_bin="")
-    inputs = iter(["11", "/no/such/path/xyz123", "q"])
+    inputs = iter(["12", "/no/such/path/xyz123", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     settings_menu(s)
     assert s.obscura_bin == ""
@@ -485,7 +529,7 @@ def test_settings_menu_obscura_invalid_keeps(monkeypatch):
 
 def test_settings_menu_chat_model_invalid_keeps(monkeypatch):
     s = _fresh(chat_model="deepseek-flash")
-    inputs = iter(["12", "bogus-model-xyz", "q"])
+    inputs = iter(["13", "bogus-model-xyz", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     settings_menu(s)
     assert s.chat_model == "deepseek-flash"
@@ -493,7 +537,7 @@ def test_settings_menu_chat_model_invalid_keeps(monkeypatch):
 
 def test_settings_menu_toggle_failover(monkeypatch):
     s = _fresh(use_multiple_accounts=True)
-    inputs = iter(["13", "q"])
+    inputs = iter(["14", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     settings_menu(s)
     assert s.use_multiple_accounts is False

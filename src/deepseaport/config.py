@@ -110,6 +110,12 @@ class Settings:
     # harness sees them. 200k keeps large single-file writes possible while
     # still bounding memory; the old 8k default dropped ordinary file writes.
     tool_args_max_chars: int = 200_000
+    # More forgiving toolcalls: opt-in repair bucket for model markup slips
+    # (pipe/space/HTML-escaped markers, smart attribute delimiters, single-
+    # tool missing-name/param inference, JSON invoke bodies).
+    # False (default) preserves strict historical parsing; True enables the
+    # bucket. Future repairs land here too, so one toggle covers them all.
+    forgiving_toolcalls: bool = False
     # True -> busy CURRENT fails over to another healthy account (parallel
     # subagents / multitasking). False -> stick to CURRENT, queue on it.
     use_multiple_accounts: bool = True
@@ -118,6 +124,20 @@ class Settings:
     # Last /model picked in server-with-chat mode. Validated in chat_ui
     # (MODELS lives in server.py; importing it here would cycle).
     chat_model: str = "deepseek-flash"
+    # Master switch for the custom wrapper below. False -> _prepare skips
+    # both append_top and append_bottom (texts preserved, just not sent).
+    enable_append: bool = True
+    # Custom text wrapped around every outgoing prompt. append_top goes at
+    # the very top (before everything, incl. tool instructions), append_bottom
+    # at the very bottom (after everything, incl. tool reminder). Free-form
+    # strings; internal newlines preserved so multi-line blocks work.
+    # Edit directly in config.json ("append_top": "line1\nline2") — "" disables.
+    append_top: str = ""
+    append_bottom: str = ""
+    # Dry run: True -> the echo response carries what dry run prints
+    # (raw body + formatted prompt). False -> slim metadata-only response;
+    # the full dump still prints on the server terminal.
+    send_dry_run_to_frontend: bool = True
 
     def save(self) -> None:
         if not self.config_path:
@@ -144,10 +164,15 @@ class Settings:
             "max_retries": self.max_retries,
             "parallel_challenge_fetch": self.parallel_challenge_fetch,
             "tool_args_max_chars": self.tool_args_max_chars,
+            "forgiving_toolcalls": self.forgiving_toolcalls,
             "use_multiple_accounts": self.use_multiple_accounts,
             "log_level": self.log_level,
             "stream_mode": self.stream_mode,
             "chat_model": self.chat_model,
+            "enable_append": self.enable_append,
+            "append_top": self.append_top,
+            "append_bottom": self.append_bottom,
+            "send_dry_run_to_frontend": self.send_dry_run_to_frontend,
         }
         data = json.dumps(payload, ensure_ascii=False, indent=2)
         target = Path(self.config_path)
@@ -292,6 +317,20 @@ def load_settings(path: str | None = None) -> Settings:
             return lowered.get(val.lower(), default)
         return val or default
 
+    def _text(env_key: str, raw_key: str) -> str:
+        # Free-form multi-line text: internal newlines preserved verbatim.
+        # No .strip(): leading spaces (code indent) and blank edge lines are
+        # the user's formatting; _prepare trims only edge blank lines when
+        # joining. \r\n normalized so Windows-edited config/env joins cleanly.
+        if env_key in os.environ:
+            return str(os.environ[env_key]).replace("\r\n", "\n")
+        val = raw.get(raw_key, "")
+        if val is None:
+            return ""
+        if not isinstance(val, str):
+            val = str(val)
+        return val.replace("\r\n", "\n")
+
     port = _int("DEEPSEAPORT_PORT", "port", DEFAULT_PORT)
     return Settings(
         keys=keys,
@@ -316,9 +355,16 @@ def load_settings(path: str | None = None) -> Settings:
             _int("DEEPSEAPORT_MAX_ARGS_CHARS", "tool_args_max_chars", 200_000)
             or 200_000
         ),
+        forgiving_toolcalls=_bool(
+            "DEEPSEAPORT_FORGIVING_TOOLCALLS", "forgiving_toolcalls", False),
         use_multiple_accounts=_bool(
             "DEEPSEAPORT_USE_MULTIPLE_ACCOUNTS", "use_multiple_accounts", True),
         log_level=_str("DEEPSEAPORT_LOG_LEVEL", "log_level", "INFO", VALID_LOG_LEVELS),
         stream_mode=_str("DEEPSEAPORT_STREAM_MODE", "stream_mode", "live", VALID_STREAM_MODES),
         chat_model=_str("DEEPSEAPORT_CHAT_MODEL", "chat_model", "deepseek-flash"),
+        enable_append=_bool("DEEPSEAPORT_ENABLE_APPEND", "enable_append", True),
+        append_top=_text("DEEPSEAPORT_APPEND_TOP", "append_top"),
+        append_bottom=_text("DEEPSEAPORT_APPEND_BOTTOM", "append_bottom"),
+        send_dry_run_to_frontend=_bool(
+            "DEEPSEAPORT_SEND_DRY_RUN_TO_FRONTEND", "send_dry_run_to_frontend", True),
     )

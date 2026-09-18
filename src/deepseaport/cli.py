@@ -60,7 +60,11 @@ def cmd_serve(args) -> int:
             from .chat_ui import run_multi_chat_servers
             return run_multi_chat_servers(current_settings, args)
 
-        return main_menu(settings, serve_fn, chat_fn, multi_fn)
+        def dry_fn(current_settings) -> int:
+            from .dry_run import run_dry_run
+            return run_dry_run(current_settings, args)
+
+        return main_menu(settings, serve_fn, chat_fn, multi_fn, dry_fn)
     return _run_server(settings, args)
 
 

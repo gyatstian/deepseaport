@@ -24,8 +24,13 @@
   "max_retries": 1,
   "parallel_challenge_fetch": true,
   "tool_args_max_chars": 200000,
+  "forgiving_toolcalls": false,
   "use_multiple_accounts": true,
   "log_level": "INFO",
   "stream_mode": "live",
-  "chat_model": "deepseek-flash"
+  "chat_model": "deepseek-flash",
+  "enable_append": true,
+  "append_top": "",
+  "append_bottom": "",
+  "send_dry_run_to_frontend": true
 }

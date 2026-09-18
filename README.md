@@ -8,7 +8,7 @@
 
 # notice
 - deepseek on the website feels lobotomized/lazy, though it's not that bad, and you can definitely make it much better with skills or good prompting. below inside the readme I added a voxel pagoda he made<br>
-- tool calling is prompt-based. The bridge now prefers the raw DSML block format for code/file arguments, repairs common malformed JSON, allows 200000-char arguments (`tool_args_max_chars` / `DEEPSEAPORT_MAX_ARGS_CHARS`), and marks truncated attempts with `finish_reason: "length"`. For very large files, ask the model to write them in several smaller calls (one by one) rather than one giant call; upstream output length is still the hard limit.<br>
+- tool calling is prompt-based. The bridge now prefers the raw DSML block format for code/file arguments, repairs common malformed JSON, allows 200000-char arguments (`tool_args_max_chars` / `DEEPSEAPORT_MAX_ARGS_CHARS`), and marks truncated attempts with `finish_reason: "length"`. Opt-in `forgiving_toolcalls` / `DEEPSEAPORT_FORGIVING_TOOLCALLS` repairs common model slips (pipe/space/HTML-escaped markers, smart attribute delimiters, single-tool missing-name/param inference, JSON invoke bodies; values never invented). For very large files, ask the model to write them in several smaller calls (one by one) rather than one giant call; upstream output length is still the hard limit.<br>
 - app needs https://aka.ms/vs/17/release/vc_redist.x64.exe beacuse of obscura
 
 # deepseaport — DeepSeek web2api (Obscura WAF + real-browser login)
@@ -100,7 +100,20 @@ mode (env: `DEEPSEAPORT_CHAT_MODEL`). All remaining behaviour flags
 (`enable_tools`, `warmup_on_startup`, `auto_delete_session`, `max_retries`,
 `parallel_challenge_fetch`, `use_multiple_accounts`, `log_level`,
 `stream_mode`) live in `config.example.json` and are editable from the
-TUI Settings screen.
+TUI Settings screen. `enable_append` (default `true`, env:
+`DEEPSEAPORT_ENABLE_APPEND`, TUI Settings 15 "Enable append") gates both:
+when `false`, stored `append_top` / `append_bottom` texts are kept but
+nothing is wrapped into requests. `append_top` / `append_bottom` (env:
+`DEEPSEAPORT_APPEND_TOP` / `DEEPSEAPORT_APPEND_BOTTOM`, TUI Settings
+16/17 "Append at top/bottom") wrap every outgoing prompt — top text goes at
+the absolute top, bottom text at the absolute bottom. Both are multi-line
+(`"append_top": "line1\nline2"` in `config.json`); `""` disables.
+`send_dry_run_to_frontend` (default `true`, env:
+`DEEPSEAPORT_SEND_DRY_RUN_TO_FRONTEND`, TUI Settings 6 "Send dry run to
+frontend"): when `true`, the Dry run reply is a normal OpenAI-shaped
+response whose content is what dry run prints (raw body + formatted
+prompt); when `false`, the content is a short note while the terminal
+still prints everything.
 
 `use_multiple_accounts` (default `true`, env:
 `DEEPSEAPORT_USE_MULTIPLE_ACCOUNTS`): when `true` and `CURRENT` is busy

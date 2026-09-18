@@ -182,15 +182,18 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
     async def _parse_stream_calls(content: str):
         """Tool-parse buffered content (tools requested); log when none found."""
         limit = prep.get("tool_args_max_chars")
+        forgiving = bool(prep.get("forgiving_toolcalls", False))
         if limit:
             calls, remaining = await asyncio.to_thread(
-                parse_tool_calls, content, prep["tools"], max_args_chars=limit)
+                parse_tool_calls, content, prep["tools"],
+                max_args_chars=limit, forgiving=forgiving)
         else:
             calls, remaining = await asyncio.to_thread(
-                parse_tool_calls, content, prep["tools"])
+                parse_tool_calls, content, prep["tools"], forgiving=forgiving)
         truncated = False
         if not calls:
-            truncated = bool(looks_truncated_tool_attempt(content, prep["tools"]))
+            truncated = bool(looks_truncated_tool_attempt(
+                content, prep["tools"], forgiving=forgiving))
             if truncated:
                 logger.warning("stream tool call looks truncated model=%s preview=%.200s",
                                prep.get("model"), (content or "")[:200])

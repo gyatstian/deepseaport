@@ -413,6 +413,175 @@ def test_parse_plain_invoke_parameter_without_dsml_prefix():
     assert json.loads(calls[0]["function"]["arguments"])["e"] == "1+1"
 
 
+# --- forgiving bucket (Settings.forgiving_toolcalls) ---
+
+def _bash_tool():
+    return [{"type": "function",
+             "function": {"name": "bash", "description": "x",
+                          "parameters": {
+                              "type": "object",
+                              "properties": {"command": {"type": "string"}},
+                              "required": ["command"]}}}]
+
+
+def test_forgiving_single_pipe_strict_rejects():
+    tools = _bash_tool()
+    text = ('<|DSML|invoke name="bash">'
+            '<|DSML|parameter name="command" string="true">echo hi</|DSML|parameter>'
+            '</|DSML|invoke>')
+    assert T.parse_tool_calls(text, tools)[0] is None
+    calls, rest = T.parse_tool_calls(text, tools, forgiving=True)
+    assert calls is not None
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "echo hi"}
+    assert rest == ""
+
+
+def test_forgiving_single_pipe_fullwidth():
+    fw = chr(0xFF5C)
+    tools = _bash_tool()
+    text = (f"<{fw}DSML{fw}invoke name=\"bash\">"
+            f"<{fw}DSML{fw}parameter name=\"command\" string=\"true\">echo hi</{fw}DSML{fw}parameter>"
+            f"</{fw}DSML{fw}invoke>")
+    assert T.parse_tool_calls(text, tools)[0] is None
+    calls, _ = T.parse_tool_calls(text, tools, forgiving=True)
+    assert calls is not None
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "echo hi"}
+
+
+def test_forgiving_zero_pipe_and_spaced_markers():
+    tools = _bash_tool()
+    zero = ('<DSML invoke name="bash">'
+            '<DSML parameter name="command" string="true">echo hi</DSML parameter>'
+            '</DSML invoke>')
+    calls, _ = T.parse_tool_calls(zero, tools, forgiving=True)
+    assert calls is not None
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "echo hi"}
+    assert T.parse_tool_calls(zero, tools)[0] is None
+    spaced = ('<|| DSML ||invoke name="bash">'
+              '<||DSML||parameter name="command" string="true">echo hi</||DSML||parameter>'
+              '</||DSML||invoke>')
+    calls, _ = T.parse_tool_calls(spaced, tools, forgiving=True)
+    assert calls is not None
+
+
+def test_forgiving_smart_quotes_and_fullwidth_equals_in_attrs():
+    tools = _bash_tool()
+    text = ('<||DSML||invoke name=\u201cbash\u201d>'
+            '<||DSML||parameter name=\u201ccommand\u201d string=\u201ctrue\u201d>'
+            'echo hi</||DSML||parameter></||DSML||invoke>')
+    assert T.parse_tool_calls(text, tools)[0] is None
+    calls, _ = T.parse_tool_calls(text, tools, forgiving=True)
+    assert calls is not None
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "echo hi"}
+    eq = ('<||DSML||invoke name\uFF1D"bash">'
+          '<||DSML||parameter name="command" string="true">echo hi</||DSML||parameter>'
+          '</||DSML||invoke>')
+    calls, _ = T.parse_tool_calls(eq, tools, forgiving=True)
+    assert calls is not None
+
+
+def test_forgiving_values_stay_verbatim():
+    tools = _bash_tool()
+    text = ('<||DSML||invoke name="bash">'
+            '<||DSML||parameter name="command" string="true">echo \u201chi\u201d'
+            '</||DSML||parameter></||DSML||invoke>')
+    calls, _ = T.parse_tool_calls(text, tools, forgiving=True)
+    assert calls is not None
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "command": "echo \u201chi\u201d"}
+
+
+def test_forgiving_html_escaped_blocks():
+    tools = _bash_tool()
+    text = ('&lt;||DSML||invoke name=&quot;bash&quot;&gt;'
+            '&lt;||DSML||parameter name=&quot;command&quot; string=&quot;true&quot;&gt;'
+            'echo hi&lt;/||DSML||parameter&gt;&lt;/||DSML||invoke&gt;')
+    assert T.parse_tool_calls(text, tools)[0] is None
+    calls, rest = T.parse_tool_calls(text, tools, forgiving=True)
+    assert calls is not None
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "echo hi"}
+    assert rest == ""
+
+
+def test_forgiving_html_escaped_value_unescaped():
+    tools = _bash_tool()
+    text = ('<||DSML||invoke name="bash">'
+            '<||DSML||parameter name="command" string="true">a &gt; b'
+            '</||DSML||parameter></||DSML||invoke>')
+    calls, _ = T.parse_tool_calls(text, tools, forgiving=True)
+    assert calls is not None
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "a > b"}
+
+
+def test_forgiving_missing_name_single_tool_only():
+    tools = _bash_tool()
+    text = ('<||DSML||invoke>'
+            '<||DSML||parameter name="command" string="true">echo hi</||DSML||parameter>'
+            '</||DSML||invoke>')
+    assert T.parse_tool_calls(text, tools)[0] is None
+    calls, _ = T.parse_tool_calls(text, tools, forgiving=True)
+    assert calls is not None
+    assert calls[0]["function"]["name"] == "bash"
+    # Multi-tool: guessing the tool would be unsafe, still dropped.
+    multi = tools + [{"type": "function",
+                      "function": {"name": "read", "description": "y",
+                                   "parameters": {"type": "object",
+                                                  "properties": {"path": {"type": "string"}}}}}]
+    assert T.parse_tool_calls(text, multi, forgiving=True)[0] is None
+    # Bare invoke with no parameters is prose noise, still skipped.
+    assert T.parse_tool_calls(
+        "<||DSML||invoke></||DSML||invoke>", tools, forgiving=True)[0] is None
+
+
+def test_forgiving_unnamed_param_fills_lone_required():
+    tools = _bash_tool()
+    text = ('<||DSML||invoke name="bash">'
+            '<||DSML||parameter string="true">echo hi</||DSML||parameter>'
+            '</||DSML||invoke>')
+    calls, _ = T.parse_tool_calls(text, tools, forgiving=True)
+    assert calls is not None
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "echo hi"}
+    # Ambiguous schemas stay untouched.
+    two = [{"type": "function",
+            "function": {"name": "cp", "description": "z",
+                         "parameters": {"type": "object",
+                                        "properties": {"src": {"type": "string"},
+                                                       "dst": {"type": "string"}},
+                                        "required": ["src", "dst"]}}}]
+    text2 = ('<||DSML||invoke name="cp">'
+             '<||DSML||parameter string="true">a</||DSML||parameter>'
+             '</||DSML||invoke>')
+    calls2, _ = T.parse_tool_calls(text2, two, forgiving=True)
+    assert calls2 is not None
+    assert json.loads(calls2[0]["function"]["arguments"]) == {}
+
+
+def test_forgiving_json_invoke_body_used_as_args():
+    tools = _bash_tool()
+    text = '<||DSML||invoke name="bash">{"command": "echo hi"}</||DSML||invoke>'
+    calls, rest = T.parse_tool_calls(text, tools, forgiving=True)
+    assert calls is not None
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "echo hi"}
+    assert rest == ""
+    # Non-JSON bodies still yield empty args (never invented).
+    text2 = '<||DSML||invoke name="bash">please run it</||DSML||invoke>'
+    calls2, _ = T.parse_tool_calls(text2, tools, forgiving=True)
+    assert calls2 is not None
+    assert json.loads(calls2[0]["function"]["arguments"]) == {}
+
+
+def test_forgiving_truncated_counts_new_marker_forms():
+    tools = _bash_tool()
+    assert T.looks_truncated_tool_attempt(
+        'x <|DSML|tool_calls> <|DSML|invoke name="bash"> hi',
+        tools, forgiving=True) is True
+    assert T.looks_truncated_tool_attempt(
+        'x <DSML invoke name="bash"> hi', tools, forgiving=True) is True
+    # Strict keeps the old exact behaviour for these slips.
+    assert T.looks_truncated_tool_attempt(
+        'x <|DSML|tool_calls> <|DSML|invoke name="bash"> hi', tools) is False
+
+
 def test_looks_truncated_tool_attempt():
     assert T.looks_truncated_tool_attempt(
         '{"tool_calls": [{"function": {"name": "write"}]') is True

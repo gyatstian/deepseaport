@@ -1085,12 +1085,15 @@ def _openai_response(prep: dict, result: dict) -> dict:
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
     limit = prep.get("tool_args_max_chars")
+    forgiving = bool(prep.get("forgiving_toolcalls", False))
     if prep["tools"]:
         if limit:
             calls, remaining = parse_tool_calls(
-                result["content"], prep["tools"], max_args_chars=limit)
+                result["content"], prep["tools"],
+                max_args_chars=limit, forgiving=forgiving)
         else:
-            calls, remaining = parse_tool_calls(result["content"], prep["tools"])
+            calls, remaining = parse_tool_calls(
+                result["content"], prep["tools"], forgiving=forgiving)
     else:
         calls, remaining = None, result["content"]
     if prep["tools"] and not calls:
@@ -1103,7 +1106,8 @@ def _openai_response(prep: dict, result: dict) -> dict:
     if calls:
         message["tool_calls"] = calls
         finish = "tool_calls"
-    elif prep["tools"] and looks_truncated_tool_attempt(result["content"], prep["tools"]):
+    elif prep["tools"] and looks_truncated_tool_attempt(
+            result["content"], prep["tools"], forgiving=forgiving):
         # The upstream web protocol has no finish_reason. An unbalanced tool
         # attempt means the reply was cut mid-call; report OpenAI's length
         # signal so the harness can retry/split instead of showing raw markup.

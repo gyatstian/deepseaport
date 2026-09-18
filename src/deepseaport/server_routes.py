@@ -309,12 +309,14 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
     if settings is not None and not getattr(settings, "enable_tools", True):
         use_tools = False
     tool_args_max_chars = None
+    forgiving_toolcalls = False
     if settings is not None:
         try:
             tool_args_max_chars = int(
                 getattr(settings, "tool_args_max_chars", 0) or 0) or None
         except (TypeError, ValueError):
             tool_args_max_chars = None
+        forgiving_toolcalls = bool(getattr(settings, "forgiving_toolcalls", False))
     if use_tools:
         messages = [{"role": "system",
                      "content": tool_system_prompt(
@@ -325,6 +327,25 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
         # Recency reminder: long histories bury the start instruction.
         # Appended after user content; non-tool path unchanged.
         prompt = prompt + "\n\n" + tool_reminder_prompt(tools)
+    # User-configured wrapper: append_top at the absolute top (before even
+    # the tool system prompt), append_bottom at the absolute bottom (after
+    # the tool reminder). Gated by enable_append (False keeps texts stored
+    # but sends nothing). Internal newlines preserved for multi-line blocks;
+    # edge blank lines trimmed so joining never stacks empty gaps.
+    # Whitespace-only counts as empty ("" disables). Checked on the final
+    # prompt so appends alone can satisfy the non-empty requirement.
+    appends_on = bool(getattr(settings, "enable_append", True)) if settings is not None else True
+    raw_top = getattr(settings, "append_top", "") if (settings is not None and appends_on) else ""
+    raw_bottom = getattr(settings, "append_bottom", "") if (settings is not None and appends_on) else ""
+    top = str(raw_top or "").strip("\r\n")
+    bottom = str(raw_bottom or "").strip("\r\n")
+    if not top.strip():
+        top = ""
+    if not bottom.strip():
+        bottom = ""
+    if top or bottom:
+        parts = ([top] if top else []) + ([prompt] if prompt.strip() else []) + ([bottom] if bottom else [])
+        prompt = "\n\n".join(parts)
     if not prompt.strip():
         raise HTTPException(
             status_code=400,
@@ -334,5 +355,6 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
         "model": model, "stream": bool(body.get("stream", False)),
         "tools": tools if use_tools else [], "prompt": prompt,
         "tool_args_max_chars": tool_args_max_chars,
+        "forgiving_toolcalls": forgiving_toolcalls,
         "thinking": thinking, "search": search, "model_type": model_type,
     }

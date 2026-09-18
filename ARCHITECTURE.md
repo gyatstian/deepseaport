@@ -124,7 +124,11 @@ name+arguments objects, and a last-resort recovery for unescaped
 OpenAI-style `arguments`. Unknown names are dropped, args are normalized to
 JSON strings, ids are `call_001…`. Per-argument size is capped by
 `Settings.tool_args_max_chars` / `DEEPSEAPORT_MAX_ARGS_CHARS` (default
-200000); replies that look like a truncated tool attempt surface
+200000); opt-in `Settings.forgiving_toolcalls` /
+`DEEPSEAPORT_FORGIVING_TOOLCALLS` (default off) enables the forgiving bucket
+(markup repairs: pipe/space/HTML-escaped DSML markers, smart attribute
+delimiters with verbatim values, single-tool missing-name/param inference,
+JSON invoke bodies); replies that look like a truncated tool attempt surface
 `finish_reason: "length"` instead of masquerading as a normal stop.
 Stream and non-stream both end with `finish_reason: "tool_calls"`.
 Multi-step loops verified live (weather → tool result → final answer).
@@ -147,10 +151,18 @@ variants under old names, `deepseek-vision`.
 ## TUI / serve modes (`tui.py`, `chat_ui.py`, `cli.py`)
 
 - `main_menu` loop: `1 Start server`, `2 Start server with chat`
-  (chat arg omitted → legacy 1-3 layout), `Settings`, `Accounts`, `q Quit`.
-  Both serve paths return to the menu on stop — no app restart to switch
-  accounts; API-side account changes are reloaded from disk afterwards
-  (`_refresh_from_disk`).
+  (chat arg omitted → legacy 1-3 layout), `Settings`, `Accounts`,
+  `Dry run` (bottom, before `q Quit`). Both serve paths return to the menu
+  on stop — no app restart to switch accounts; API-side account changes are
+  reloaded from disk afterwards (`_refresh_from_disk`).   `send_dry_run_to_frontend`
+  (Request handling 6, default ON) controls whether the reply content carries
+  the printed raw + formatted dump or a short terminal-only note.
+- Dry run (`dry_run.py`): same port/host/stop-key wiring as serve but no
+  bridge, no pool, no preflight. `POST /v1/chat/completions` runs `_prepare`
+  (message validation, tool prompts, `append_top`/`append_bottom`), prints
+  the raw body + formatted prompt to the terminal, and replies with a normal
+  OpenAI-shaped response carrying that dump as the message content
+  (`stream: true` gets it as SSE chunks). Nothing is persisted.
 - Pre-flight guard (`_preflight_reason`): Start is blocked when the pool is
   empty or no account has a token (first request would 503/401). The menu
   prints why and jumps into `accounts_menu` so the fix is one step away.
@@ -183,7 +195,12 @@ variants under old names, `deepseek-vision`.
 
 ## Environment / files
 
-- `config.json` (gitignored): `{keys, accounts[{email,mobile,password,token,banned,banned_until}], active_account, obscura_bin, obscura_profile, browser_bin, browser_headless, port, listen, enable_tools, warmup_on_startup, auto_delete_session, max_retries, parallel_challenge_fetch, tool_args_max_chars, use_multiple_accounts, log_level, stream_mode, chat_model}`.
+- `config.json` (gitignored): `{keys, accounts[{email,mobile,password,token,banned,banned_until}], active_account, obscura_bin, obscura_profile, browser_bin, browser_headless, port, listen, enable_tools, warmup_on_startup, auto_delete_session, max_retries, parallel_challenge_fetch, tool_args_max_chars, forgiving_toolcalls, use_multiple_accounts, log_level, stream_mode, chat_model, enable_append, append_top, append_bottom, send_dry_run_to_frontend}`.
+  `enable_append` (default true) gates both appends in `_prepare` (false keeps
+  texts stored but sends nothing); `append_top`/`append_bottom` are free-form
+  multi-line strings wrapped around
+  every outgoing prompt in `_prepare` (top at the absolute top, bottom at the
+  absolute bottom); `""` disables. Env: `DEEPSEAPORT_ENABLE_APPEND`, `DEEPSEAPORT_APPEND_TOP/BOTTOM`.
   `AccountConfig.__post_init__` normalizes pasted token JSON (including
   `{"value":null}`) through `tokens.py`, so broken shapes become an empty token
   instead of a mysterious 40003 later. Bans found by the server/login page are

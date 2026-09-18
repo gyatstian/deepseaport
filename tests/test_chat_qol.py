@@ -353,7 +353,7 @@ def test_settings_menu_groups_options_and_dispatches(monkeypatch, capsys):
     from deepseaport.tui import settings_menu
 
     s = Settings(config_path="", stream_mode="live")
-    inputs = iter(["7", "q"])  # 7 = Reply streaming, q = back
+    inputs = iter(["8", "q"])  # 8 = Reply streaming, q = back
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     settings_menu(s)
 

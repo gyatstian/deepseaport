@@ -414,7 +414,7 @@ def test_openai_response_tool_calls_shape(monkeypatch):
     calls = [{"id": "call_1", "type": "function",
               "function": {"name": "get_time", "arguments": "{}"}}]
     monkeypatch.setattr("deepseaport.server.parse_tool_calls",
-                        lambda content, tools: (calls, ""))
+                        lambda content, tools, **kw: (calls, ""))
     prep = _base_prep(tools=[{"function": {"name": "get_time"}}])
     out = _openai_response(prep, {"content": "{}", "thinking": "",
                                   "usage_total": 3})
@@ -426,7 +426,7 @@ def test_openai_response_tool_calls_shape(monkeypatch):
 def test_openai_response_truncated_tool_attempt_marks_length(monkeypatch):
     monkeypatch.setattr(
         "deepseaport.server.parse_tool_calls",
-        lambda content, tools: (None, content))
+        lambda content, tools, **kw: (None, content))
     prep = _base_prep(tools=[{"function": {"name": "get_time"}}])
     out = _openai_response(
         prep, {"content": '{"tool_calls": [{"function": {"name": "get_time"}',
